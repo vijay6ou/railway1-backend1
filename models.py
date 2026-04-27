@@ -34,7 +34,6 @@ class Session(Base):
     ai_commentary   = Column(Text, nullable=True)
     csv_data        = Column(Text, nullable=True)
     csv_filename    = Column(String, nullable=True)
-    # New fields
-    chart_image     = Column(Text, nullable=True)   # base64 encoded image
-    journal         = Column(Text, nullable=True)   # free-form trade journal markdown
-    strikes_json    = Column(Text, default="[]")    # parsed strike-level data from CSV
+    chart_image     = Column(Text, nullable=True)
+    journal         = Column(Text, nullable=True)
+    strikes_json    = Column(Text, default="[]")
