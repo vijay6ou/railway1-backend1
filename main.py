@@ -1,857 +1,1733 @@
-<!DOCTYPE html>
+"""
+VJ Trading Dashboard — FastAPI v3
+"""
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse
+from sqlalchemy.orm import Session as DBSession
+import json, os, base64
+
+from database import engine, get_db, Base
+from models import Session as SessionModel
+from schemas import SessionCreate, TokenRequest, TokenResponse, MessageResponse
+from auth import authenticate_user, create_access_token, get_current_user, require_admin
+from csv_parser import parse_orderbook_csv
+from seed import seed
+
+Base.metadata.create_all(bind=engine)
+seed()
+
+app = FastAPI(title="VJ Trading Dashboard", version="3.0.0",
+              docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+@app.get("/", include_in_schema=False)
+def serve_dashboard():
+    for candidate in [
+        os.path.join(STATIC_DIR, "index.html"),
+        os.path.join(BASE_DIR, "index.html"),
+        os.path.join(BASE_DIR, "public", "index.html"),
+    ]:
+        if os.path.exists(candidate):
+            return FileResponse(candidate, media_type="text/html")
+    return HTMLResponse(content=_DASHBOARD_HTML, status_code=200)
+
+@app.get("/health", tags=["Health"])
+def health():
+    return {"status": "ok"}
+
+# ── AUTH ──
+@app.post("/auth/token", response_model=TokenResponse, tags=["Auth"])
+def login(body: TokenRequest):
+    user = authenticate_user(body.username, body.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    token = create_access_token({"sub": user["username"], "role": user["role"]})
+    return {"access_token": token}
+
+@app.get("/auth/me", tags=["Auth"])
+def get_me(user: dict = Depends(get_current_user)):
+    return {"username": user["username"], "role": user["role"]}
+
+# ── SESSIONS ──
+@app.get("/sessions", tags=["Sessions"])
+def get_sessions(db: DBSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    rows = db.query(SessionModel).order_by(SessionModel.id).all()
+    return [_row_to_dict(r) for r in rows]
+
+@app.get("/sessions/{session_id}", tags=["Sessions"])
+def get_session(session_id: str, db: DBSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return _row_to_dict(row)
+
+@app.post("/sessions", tags=["Sessions"])
+def create_or_update_session(body: SessionCreate, db: DBSession = Depends(get_db),
+                              user: dict = Depends(require_admin)):
+    existing = db.query(SessionModel).filter(SessionModel.id == body.id).first()
+    data = {
+        "id": body.id, "date": body.date, "full": body.full,
+        "index_name": body.index_name, "dte": body.dte,
+        "vix": body.vix, "capital": body.capital,
+        "gross_pnl": body.gross_pnl, "net_pnl": body.net_pnl,
+        "net_roi": body.net_roi, "gross_roi": body.gross_roi,
+        "ce_pnl": body.ce_pnl, "pe_pnl": body.pe_pnl,
+        "charges": body.charges, "executed": body.executed,
+        "rejected": body.rejected, "mt": body.mt,
+        "carry_out": body.carry_out, "note": body.note,
+        "journal": body.journal,
+        "peer_rois_json":   json.dumps(body.peer_rois),
+        "scores_json":      json.dumps(body.scores.dict()),
+        "violations_json":  json.dumps(body.violations),
+        "strengths_json":   json.dumps(body.strengths),
+    }
+    if existing:
+        for k, v in data.items():
+            setattr(existing, k, v)
+        db.commit()
+        return {"message": "Session updated", "id": body.id}
+    else:
+        db.add(SessionModel(**data))
+        db.commit()
+        return {"message": "Session created", "id": body.id}
+
+@app.delete("/sessions/{session_id}", tags=["Sessions"])
+def delete_session(session_id: str, db: DBSession = Depends(get_db),
+                   user: dict = Depends(require_admin)):
+    row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    db.delete(row)
+    db.commit()
+    return {"message": f"Session {session_id} deleted"}
+
+# ── CSV UPLOAD ──
+@app.post("/upload-csv/{session_id}", tags=["CSV"])
+async def upload_csv(session_id: str, file: UploadFile = File(...),
+                     db: DBSession = Depends(get_db), user: dict = Depends(require_admin)):
+    filename = file.filename or ""
+    csv_bytes = await file.read()
+    csv_text = None
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            csv_text = csv_bytes.decode(enc); break
+        except Exception:
+            continue
+    if csv_text is None:
+        raise HTTPException(status_code=400, detail="Could not decode CSV file")
+    result = parse_orderbook_csv(csv_text)
+    if "error" in result:
+        raise HTTPException(status_code=422, detail=result["error"])
+    row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    if not row:
+        row = SessionModel(id=session_id, date=session_id, full=session_id,
+                           index_name=result["index_name"])
+        db.add(row)
+    row.csv_data      = csv_text
+    row.csv_filename  = filename
+    row.gross_pnl     = result["gross_pnl"]
+    row.net_pnl       = result["net_pnl"]
+    row.ce_pnl        = result["ce_pnl"]
+    row.pe_pnl        = result["pe_pnl"]
+    row.charges       = result["total_charges"]
+    row.executed      = result["executed"]
+    row.rejected      = result["rejected"]
+    row.index_name    = result["index_name"]
+    row.strikes_json  = json.dumps(result["strikes"])
+    if row.capital and row.capital > 0:
+        row.net_roi   = round(result["net_pnl"]   / row.capital * 100, 4)
+        row.gross_roi = round(result["gross_pnl"] / row.capital * 100, 4)
+    db.commit()
+    return {
+        "session_id": session_id, "gross_pnl": result["gross_pnl"],
+        "net_pnl": result["net_pnl"], "ce_pnl": result["ce_pnl"],
+        "pe_pnl": result["pe_pnl"], "charges_breakdown": result["charges_breakdown"],
+        "total_charges": result["total_charges"], "executed": result["executed"],
+        "rejected": result["rejected"], "strikes": result["strikes"],
+        "carry_positions": result["carry_positions"], "warnings": result["warnings"],
+        "message": f"Parsed {result['executed']} orders, {len(result['strikes'])} strikes"
+    }
+
+# ── CHART UPLOAD ──
+@app.post("/upload-chart/{session_id}", tags=["Charts"])
+async def upload_chart(session_id: str, file: UploadFile = File(...),
+                       db: DBSession = Depends(get_db), user: dict = Depends(require_admin)):
+    img_bytes = await file.read()
+    if len(img_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large (max 10MB)")
+    b64  = base64.b64encode(img_bytes).decode("utf-8")
+    ext  = (file.filename or "chart.png").rsplit(".", 1)[-1].lower()
+    mime = f"image/{ext}" if ext in ("jpg","jpeg","png","webp","gif") else "image/png"
+    row  = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    row.chart_image = f"data:{mime};base64,{b64}"
+    db.commit()
+    return {"message": "Chart uploaded", "session_id": session_id}
+
+@app.delete("/upload-chart/{session_id}", tags=["Charts"])
+def delete_chart(session_id: str, db: DBSession = Depends(get_db),
+                 user: dict = Depends(require_admin)):
+    row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    row.chart_image = None
+    db.commit()
+    return {"message": "Chart deleted"}
+
+# ── AI COMMENTARY ──
+@app.post("/ai-commentary/{session_id}", tags=["AI"])
+async def generate_ai_commentary(session_id: str, db: DBSession = Depends(get_db),
+                                  user: dict = Depends(require_admin)):
+    import httpx
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    scores     = json.loads(row.scores_json or "{}")
+    violations = json.loads(row.violations_json or "[]")
+    strengths  = json.loads(row.strengths_json or "[]")
+    strikes    = json.loads(row.strikes_json or "[]")
+    strikes_summary = ""
+    if strikes:
+        strikes_summary = "\nTop strikes: " + ", ".join(
+            f"{s['symbol']} P&L ₹{s['realized']:,.0f}" for s in strikes[:3])
+    prompt = f"""Indian index options trading coach analyzing Vijay's session.
+SESSION: {row.full} — {row.index_name} Expiry
+VIX: {row.vix} | Capital: ₹{(row.capital or 0)/1e7:.2f}Cr | MT: {row.mt}/10
+Gross P&L: ₹{(row.gross_pnl or 0):,.0f} | Net P&L: ₹{(row.net_pnl or 0):,.0f} | ROI: {row.net_roi or 0:.3f}%
+CE: ₹{(row.ce_pnl or 0):,.0f} | PE: ₹{(row.pe_pnl or 0):,.0f} | Charges: ₹{(row.charges or 0):,.0f}{strikes_summary}
+Violations: {violations} | Strengths: {strengths}
+Journal: {row.journal or "Not provided"}
+Give sharp 3-paragraph commentary: (1) what the numbers say (2) one thing to fix (3) next session strike guidance."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 700,
+                  "messages": [{"role": "user", "content": prompt}]}
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {resp.text}")
+    row.ai_commentary = resp.json()["content"][0]["text"]
+    db.commit()
+    return {"session_id": session_id, "commentary": row.ai_commentary}
+
+# ── HELPERS ──
+def _row_to_dict(r):
+    return {
+        "id": r.id, "date": r.date, "full": r.full,
+        "index": r.index_name, "dte": r.dte,
+        "vix": r.vix, "capital": r.capital,
+        "gross_pnl": r.gross_pnl, "net_pnl": r.net_pnl,
+        "net_roi": r.net_roi, "gross_roi": r.gross_roi,
+        "ce_pnl": r.ce_pnl, "pe_pnl": r.pe_pnl,
+        "charges": r.charges, "executed": r.executed,
+        "rejected": r.rejected, "mt": r.mt,
+        "carry_out": r.carry_out, "note": r.note, "journal": r.journal,
+        "peer_rois":   json.loads(r.peer_rois_json or "[]"),
+        "scores":      json.loads(r.scores_json or "{}"),
+        "violations":  json.loads(r.violations_json or "[]"),
+        "strengths":   json.loads(r.strengths_json or "[]"),
+        "ai_commentary": r.ai_commentary,
+        "csv_filename":  r.csv_filename,
+        "has_chart":     bool(r.chart_image),
+        "chart_image":   r.chart_image,
+        "strikes":       json.loads(r.strikes_json or "[]"),
+    }
+
+
+# ── EMBEDDED DASHBOARD (fallback) ──
+_DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VJ Trading Dashboard</title>
+<!-- CDN replacements for local files -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
-  :root {
-    --bg:#0a0e1a; --surface:#111827; --surface2:#1a2235; --border:#1e2d45;
-    --accent:#00d4ff; --accent2:#7c3aed; --green:#10b981; --red:#ef4444;
-    --yellow:#f59e0b; --text:#e2e8f0; --muted:#64748b;
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600&display=swap');
+:root{
+  --bg:#07090e;--s1:#0d1117;--s2:#161b22;--s3:#1e2530;--s4:#252d38;
+  --bd:#2a3441;--bd2:#364553;
+  --tx:#c9d1d9;--tx2:#8b949e;--tx3:#495867;
+  --gr:#3fb950;--gr2:rgba(63,185,80,.12);
+  --rd:#f85149;--rd2:rgba(248,81,73,.12);
+  --am:#d29922;--am2:rgba(210,153,34,.12);
+  --bl:#58a6ff;--bl2:rgba(88,166,255,.12);
+  --pr:#bc8cff;--pr2:rgba(188,140,255,.12);
+  --ac:#f78166;
+  --fn:'Inter',sans-serif;--fm:'JetBrains Mono',monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--tx);font-family:var(--fn);font-size:13px}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:3px}
 
-  /* ── LOGIN SCREEN ── */
-  .login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
-  .login-box{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:40px;width:100%;max-width:380px}
-  .login-box h1{font-size:22px;margin-bottom:8px}.login-box p{color:var(--muted);font-size:13px;margin-bottom:28px}
-  .login-err{color:var(--red);font-size:12px;margin-top:8px;min-height:16px}
+/* ── LAYOUT ── */
+#app{display:flex;flex-direction:column;height:100vh}
+#topbar{background:var(--s1);border-bottom:1px solid var(--bd);padding:0 20px;height:52px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+#workspace{display:flex;flex:1;overflow:hidden}
+#sidebar{width:200px;background:var(--s1);border-right:1px solid var(--bd);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto;padding:8px 0}
+#main{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
 
-  /* ── HEADER ── */
-  .header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
-  .header-left{display:flex;align-items:center;gap:10px}
-  .logo{width:34px;height:34px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;color:#fff}
-  .header h1{font-size:17px;font-weight:700}.header h1 span{color:var(--accent)}
-  .header-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-  .badge{background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:3px 10px;font-size:12px;color:var(--muted)}
-  .badge b{color:var(--accent)}
-  .role-badge{background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:3px 10px;font-size:11px;color:var(--yellow)}
+/* ── LOGIN OVERLAY ── */
+#login-overlay{position:fixed;inset:0;background:var(--bg);z-index:999;display:flex;align-items:center;justify-content:center}
+.login-box{background:var(--s1);border:1px solid var(--bd2);border-radius:12px;padding:36px;width:360px}
+.login-box h2{font-family:var(--fm);font-size:18px;color:var(--bl);margin-bottom:6px}
+.login-box p{font-size:12px;color:var(--tx3);margin-bottom:24px}
+.lf-row{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}
+.lf-row label{font-size:11px;color:var(--tx2);font-weight:500}
+.lf-row input{background:var(--s3);border:1px solid var(--bd);color:var(--tx);font-size:13px;border-radius:6px;padding:9px 11px;font-family:var(--fn);transition:border-color .15s;width:100%}
+.lf-row input:focus{outline:none;border-color:var(--bl)}
+#login-err{color:var(--rd);font-size:12px;min-height:16px;margin-bottom:8px;font-family:var(--fm)}
 
-  /* ── TABS ── */
-  .tab-bar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 24px;display:flex;gap:4px;overflow-x:auto}
-  .tab{padding:11px 18px;font-size:13px;font-weight:500;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap;transition:all .2s}
-  .tab:hover{color:var(--text)}.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+/* ── TOPBAR ── */
+.tb-left{display:flex;align-items:center;gap:12px}
+.brand{font-family:var(--fm);font-weight:600;font-size:15px;color:var(--bl);letter-spacing:-.5px}
+.tb-badge{background:var(--s3);border:1px solid var(--bd);border-radius:4px;padding:3px 9px;font-family:var(--fm);font-size:10px;color:var(--tx2)}
+.tb-right{display:flex;align-items:center;gap:8px}
+.ldot{width:7px;height:7px;border-radius:50%;background:var(--gr);box-shadow:0 0 6px var(--gr);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.tb-vix{background:var(--am2);border:1px solid rgba(210,153,34,.3);color:var(--am);font-family:var(--fm);font-size:11px;padding:3px 10px;border-radius:4px}
+.tb-user{font-family:var(--fm);font-size:11px;color:var(--tx2);padding:3px 8px;background:var(--s3);border:1px solid var(--bd);border-radius:4px}
 
-  /* ── CONTENT ── */
-  .content{padding:24px;max-width:1400px;margin:0 auto}
-  .panel{display:none}.panel.active{display:block}
+/* ── SIDEBAR ── */
+.sb-section{font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--tx3);padding:10px 14px 4px}
+.sb-item{padding:7px 14px;cursor:pointer;display:flex;align-items:center;gap:9px;color:var(--tx2);font-size:12px;border-left:2px solid transparent;transition:all .15s}
+.sb-item:hover{color:var(--tx);background:var(--s2)}
+.sb-item.active{color:var(--bl);background:rgba(88,166,255,.07);border-left-color:var(--bl)}
+.sb-ico{font-size:13px;width:16px;text-align:center;flex-shrink:0}
+.sb-cnt{margin-left:auto;background:var(--s4);border-radius:10px;font-family:var(--fm);font-size:10px;padding:1px 6px;color:var(--tx3)}
 
-  /* ── CARDS ── */
-  .cards-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(185px,1fr));gap:14px;margin-bottom:22px}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px}
-  .card-label{font-size:11px;text-transform:uppercase;letter-spacing:.9px;color:var(--muted);margin-bottom:7px}
-  .card-value{font-size:22px;font-weight:700}.card-sub{font-size:11px;color:var(--muted);margin-top:3px}
-  .green{color:var(--green)}.red{color:var(--red)}.yellow{color:var(--yellow)}.accent{color:var(--accent)}
+/* ── CARDS ── */
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:8px;padding:16px}
+.card-title{font-size:11px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--tx3);margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.card-badge{font-size:10px;background:var(--s3);border:1px solid var(--bd);border-radius:3px;padding:1px 7px;font-weight:400;text-transform:none;letter-spacing:0;color:var(--tx2)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
 
-  /* ── TABLE ── */
-  .table-wrap{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:20px}
-  table{width:100%;border-collapse:collapse}
-  thead th{background:var(--surface2);padding:11px 14px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--muted)}
-  tbody tr{border-bottom:1px solid var(--border);transition:background .15s}
-  tbody tr:hover{background:var(--surface2)}
-  tbody tr:last-child{border-bottom:none}
-  tbody td{padding:12px 14px;font-size:13px}
+/* ── METRIC CARDS ── */
+.mc{background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:13px 15px}
+.mc-lbl{font-size:9px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--tx3);margin-bottom:6px}
+.mc-val{font-family:var(--fm);font-size:20px;font-weight:600;margin-bottom:3px}
+.mc-sub{font-size:10px;color:var(--tx2)}
+.pos{color:var(--gr)}.neg{color:var(--rd)}.neu{color:var(--am)}
 
-  /* ── SCORE BAR ── */
-  .score-row{display:flex;align-items:center;gap:10px;margin-bottom:9px}
-  .score-label{width:155px;font-size:13px;color:var(--muted);flex-shrink:0}
-  .score-bar-bg{flex:1;height:7px;background:var(--surface2);border-radius:4px;overflow:hidden}
-  .score-bar-fill{height:100%;border-radius:4px;transition:width .6s ease}
-  .score-num{width:36px;text-align:right;font-size:13px;font-weight:600}
+/* ── TABLES ── */
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{font-size:10px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--tx3);padding:6px 10px;border-bottom:1px solid var(--bd);text-align:left}
+.tbl td{padding:8px 10px;border-bottom:1px solid rgba(42,52,65,.5);font-size:12px}
+.tbl tbody tr:last-child td{border-bottom:none}
+.tbl tbody tr:hover td{background:var(--s2)}
+.fm{font-family:var(--fm)}
 
-  /* ── SESSION SELECTOR ── */
-  .session-selector{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 20px;margin-bottom:20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-  .session-selector label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}
-  select{background:var(--surface2);border:1px solid var(--border);border-radius:7px;color:var(--text);padding:7px 11px;font-size:13px;cursor:pointer;outline:none}
-  select:focus{border-color:var(--accent)}
+/* ── BADGES ── */
+.badge{display:inline-block;font-size:10px;font-weight:500;padding:2px 8px;border-radius:3px;font-family:var(--fm)}
+.b-gr{background:var(--gr2);color:var(--gr)}.b-rd{background:var(--rd2);color:var(--rd)}
+.b-am{background:var(--am2);color:var(--am)}.b-bl{background:var(--bl2);color:var(--bl)}
+.b-pr{background:var(--pr2);color:var(--pr)}
 
-  /* ── FORMS ── */
-  .form-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}
-  .form-group{display:flex;flex-direction:column;gap:5px}
-  .form-group label{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
-  .form-group input,.form-group select,.form-group textarea{background:var(--surface2);border:1px solid var(--border);border-radius:7px;color:var(--text);padding:9px 11px;font-size:13px;outline:none;font-family:inherit}
-  .form-group input:focus,.form-group select:focus,.form-group textarea:focus{border-color:var(--accent)}
-  .btn{background:linear-gradient(135deg,var(--accent),#0099bb);color:#000;font-weight:700;font-size:13px;padding:9px 20px;border-radius:7px;border:none;cursor:pointer;transition:opacity .2s}
-  .btn:hover{opacity:.85}
-  .btn-sec{background:var(--surface2);color:var(--text);border:1px solid var(--border);font-weight:500}
-  .btn-sec:hover{border-color:var(--accent);color:var(--accent);opacity:1}
-  .btn-red{background:var(--red);color:#fff}
+/* ── INPUTS ── */
+input[type=text],input[type=number],select,textarea{background:var(--s3);border:1px solid var(--bd);color:var(--tx);font-size:12px;border-radius:6px;padding:7px 10px;font-family:var(--fn);transition:border-color .15s;width:100%}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--bl)}
+textarea{resize:vertical;font-family:var(--fm);font-size:11px}
+label{font-size:11px;color:var(--tx2);margin-bottom:4px;display:block;font-weight:500}
+.form-row{display:flex;flex-direction:column;gap:4px}
+.form-grid{display:grid;gap:12px}
 
-  /* ── DETAIL ITEMS ── */
-  .list-item{padding:9px 13px;border-left:3px solid;border-radius:0 7px 7px 0;background:var(--surface2);margin-bottom:7px;font-size:13px;line-height:1.5}
-  .list-item.violation{border-color:var(--red)}.list-item.strength{border-color:var(--green)}
+/* ── BUTTONS ── */
+.btn{background:var(--s3);border:1px solid var(--bd2);color:var(--tx);font-size:12px;font-family:var(--fn);font-weight:500;border-radius:6px;padding:7px 14px;cursor:pointer;transition:all .15s}
+.btn:hover{background:var(--s4);border-color:var(--bd)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-pr{background:rgba(88,166,255,.12);border-color:rgba(88,166,255,.4);color:var(--bl)}
+.btn-gr{background:var(--gr2);border-color:rgba(63,185,80,.4);color:var(--gr)}
+.btn-rd{background:var(--rd2);border-color:rgba(248,81,73,.4);color:var(--rd)}
+.btn-sm{font-size:11px;padding:4px 10px}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 
-  /* ── SECTION TITLE ── */
-  .section-title{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:14px;display:flex;align-items:center;gap:8px}
-  .section-title::after{content:'';flex:1;height:1px;background:var(--border)}
+/* ── CHARTS ── */
+.chart-wrap{position:relative;height:180px}
+.chart-wrap-sm{position:relative;height:140px}
 
-  /* ── CHARTS ── */
-  .chart-wrap{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:22px;margin-bottom:20px}
+/* ── PROGRESS BARS ── */
+.pbar{height:5px;background:var(--s4);border-radius:3px;overflow:hidden;margin-top:4px}
+.pfill{height:100%;border-radius:3px;transition:width .5s}
 
-  /* ── MODAL ── */
-  .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:200;align-items:center;justify-content:center}
-  .modal-overlay.open{display:flex}
-  .modal{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:28px;width:90%;max-width:640px;max-height:90vh;overflow-y:auto}
-  .modal h2{font-size:17px;margin-bottom:20px;color:var(--accent)}
-  .modal-actions{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap}
+/* ── SCORE RING ── */
+.ring-section{display:flex;align-items:center;gap:20px}
+.ring-wrap{position:relative;width:110px;height:110px;flex-shrink:0}
+.ring-wrap canvas{position:absolute;top:0;left:0}
+.ring-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.ring-val{font-family:var(--fm);font-size:24px;font-weight:600}
+.ring-lbl{font-size:10px;color:var(--tx2)}
+.dims{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.dim{display:flex;flex-direction:column;gap:3px}
+.dim-row{display:flex;justify-content:space-between;font-size:11px;color:var(--tx2)}
 
-  /* ── INFO BOX ── */
-  .info-box{background:var(--surface2);border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:7px;padding:14px;margin-bottom:16px;font-size:13px;line-height:1.7;color:var(--muted)}
-  .info-box b{color:var(--text)}.info-box code{background:var(--bg);padding:2px 5px;border-radius:3px;font-family:monospace;color:var(--accent);font-size:12px}
+/* ── ALERTS ROW ── */
+.alert-row{display:flex;align-items:flex-start;gap:9px;padding:7px 0;border-bottom:1px solid rgba(42,52,65,.4)}
+.alert-row:last-child{border-bottom:none}
+.adot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:4px}
 
-  /* ── UPLOAD ZONE ── */
-  .upload-zone{border:2px dashed var(--border);border-radius:10px;padding:32px;text-align:center;cursor:pointer;transition:border-color .2s;margin-bottom:16px}
-  .upload-zone:hover,.upload-zone.drag{border-color:var(--accent)}
-  .upload-zone p{color:var(--muted);font-size:13px;margin-top:8px}
+/* ── UPLOAD ZONE ── */
+#drop-zone{border:2px dashed var(--bd2);border-radius:10px;padding:28px;text-align:center;color:var(--tx2);cursor:pointer;transition:all .2s;background:var(--s2)}
+#drop-zone:hover,#drop-zone.drag{border-color:var(--bl);color:var(--bl);background:rgba(88,166,255,.05)}
+#drop-zone .dz-ico{font-size:32px;margin-bottom:8px;display:block}
+#drop-zone .dz-txt{font-size:13px;font-weight:500;margin-bottom:4px}
+#drop-zone .dz-sub{font-size:11px;color:var(--tx3)}
 
-  /* ── AI COMMENTARY ── */
-  .commentary-box{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:18px;font-size:13px;line-height:1.8;color:var(--text);white-space:pre-wrap}
+/* ── CONFIG STRIP ── */
+#cfg-strip{background:var(--s1);border:1px solid var(--bd);border-radius:8px;padding:12px 16px;display:grid;gap:12px;grid-template-columns:repeat(6,1fr)}
 
-  /* ── SPINNER ── */
-  .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;margin-right:6px}
-  @keyframes spin{to{transform:rotate(360deg)}}
+/* ── CARRY PANEL ── */
+#carry-panel{background:var(--s1);border:1px solid var(--am);border-radius:8px;padding:14px}
+.carry-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid rgba(42,52,65,.5)}
+.carry-row:last-child{border-bottom:none}
+.carry-sym{font-family:var(--fm);font-size:11px;width:200px;flex-shrink:0}
+.carry-side{width:60px;text-align:center}
+.carry-qty{width:60px;text-align:right;font-family:var(--fm);font-size:11px}
 
-  /* ── NOTIFICATION ── */
-  #notify{position:fixed;bottom:22px;right:22px;background:var(--green);color:#000;padding:11px 18px;border-radius:9px;font-size:13px;font-weight:600;transform:translateY(80px);opacity:0;transition:all .3s;z-index:999}
-  #notify.show{transform:translateY(0);opacity:1}
-  #notify.error{background:var(--red);color:#fff}
+/* ── MODAL ── */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100;display:flex;align-items:center;justify-content:center}
+.modal{background:var(--s1);border:1px solid var(--bd2);border-radius:10px;padding:22px;width:560px;max-width:95vw;max-height:90vh;overflow-y:auto}
+.modal-title{font-size:15px;font-weight:600;margin-bottom:16px;color:var(--tx)}
+.modal-close{float:right;background:none;border:none;color:var(--tx2);cursor:pointer;font-size:18px;margin-top:-2px}
 
-  /* ── LOADING OVERLAY ── */
-  #loading{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:500;flex-direction:column;gap:12px}
-  #loading.hidden{display:none}
-  .load-text{color:var(--muted);font-size:14px}
+/* ── SESSION LIST ITEM ── */
+.sess-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid var(--bd);cursor:pointer;transition:background .12s}
+.sess-item:hover{background:var(--s2)}
+.sess-item.sel{background:rgba(88,166,255,.07);border-left:2px solid var(--bl)}
+.sess-left{flex:1;min-width:0}
+.sess-date{font-family:var(--fm);font-size:11px;color:var(--tx);font-weight:500}
+.sess-idx{font-size:10px;color:var(--tx2)}
+.sess-right{text-align:right}
+.sess-pnl{font-family:var(--fm);font-size:12px;font-weight:600}
+.sess-roi{font-size:10px;color:var(--tx2);font-family:var(--fm)}
 
-  @media(max-width:600px){.content{padding:14px}.cards-row{grid-template-columns:1fr 1fr}.header h1{font-size:14px}}
+/* ── TABS ── */
+.tab-row{display:flex;gap:0;border-bottom:1px solid var(--bd);margin-bottom:14px}
+.tab{padding:8px 16px;cursor:pointer;font-size:12px;font-weight:500;color:var(--tx2);border-bottom:2px solid transparent;transition:all .15s;margin-bottom:-1px}
+.tab:hover{color:var(--tx)}
+.tab.active{color:var(--bl);border-bottom-color:var(--bl)}
+
+/* ── TOAST ── */
+#toast-wrap{position:fixed;bottom:20px;right:20px;z-index:200;display:flex;flex-direction:column;gap:8px}
+.toast{background:var(--s3);border:1px solid var(--bd2);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--tx);animation:fadeIn .2s;max-width:320px}
+.toast.ok{border-color:rgba(63,185,80,.5);color:var(--gr)}
+.toast.err{border-color:rgba(248,81,73,.5);color:var(--rd)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* ── CE/PE SPLIT BAR ── */
+.split-bar{display:flex;height:8px;border-radius:4px;overflow:hidden;margin:8px 0 4px}
+
+/* ── HEATMAP ── */
+.hm-row{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.hm-lbl{width:80px;font-size:10px;color:var(--tx2);font-family:var(--fm);text-align:right;flex-shrink:0}
+.hm-bar{flex:1;height:26px;border-radius:4px;display:flex;align-items:center;padding:0 10px;justify-content:flex-end}
+.hm-val{font-family:var(--fm);font-size:10px;font-weight:500}
+
+/* ── EMPTY STATE ── */
+.empty{text-align:center;padding:40px 20px;color:var(--tx3)}
+.empty-ico{font-size:36px;margin-bottom:10px;display:block}
+.empty-txt{font-size:13px;color:var(--tx2);margin-bottom:6px}
+.empty-sub{font-size:11px}
+
+/* ── CHART IMAGE ── */
+.chart-img-wrap{border:1px solid var(--bd);border-radius:6px;overflow:hidden;background:var(--s3);min-height:80px;display:flex;align-items:center;justify-content:center}
+.chart-img-wrap img{width:100%;max-height:280px;object-fit:contain;display:block}
+
+/* ── PEER ROI ── */
+.peer-row{display:flex;align-items:center;gap:10px;padding:5px 0}
+.peer-bar-wrap{flex:1;height:18px;background:var(--s4);border-radius:3px;overflow:hidden;position:relative}
+.peer-bar-fill{height:100%;border-radius:3px;transition:width .5s}
+.peer-val{font-family:var(--fm);font-size:11px;width:70px;text-align:right}
+
+/* ── CHGROW ── */
+.chg-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(42,52,65,.4)}
+.chg-row:last-child{border-bottom:none}
+.chg-lbl{font-size:12px;color:var(--tx2)}
+.chg-val{font-family:var(--fm);font-size:12px;font-weight:500}
+
+/* ── JOURNAL / CHART UPLOAD ── */
+.drop-sm{border:2px dashed var(--bd2);border-radius:8px;padding:16px;text-align:center;cursor:pointer;transition:all .2s;background:var(--s2);font-size:12px;color:var(--tx2)}
+.drop-sm:hover{border-color:var(--bl);color:var(--bl)}
 </style>
 </head>
 <body>
 
-<!-- ── LOADING SCREEN ── -->
-<div id="loading">
-  <div class="logo" style="width:48px;height:48px;font-size:18px">VJ</div>
-  <div class="load-text" id="load-msg">Connecting to server…</div>
-</div>
-
-<!-- ── LOGIN SCREEN ── -->
-<div class="login-wrap" id="login-screen" style="display:none">
+<!-- LOGIN OVERLAY -->
+<div id="login-overlay">
   <div class="login-box">
-    <h1>VJ Trading</h1>
-    <p>Sign in to access your trading performance dashboard.</p>
-    <div class="form-group" style="margin-bottom:12px">
-      <label>Username</label>
-      <input type="text" id="l-user" placeholder="vijay" autocomplete="username">
-    </div>
-    <div class="form-group" style="margin-bottom:16px">
-      <label>Password</label>
-      <input type="password" id="l-pass" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
-    </div>
-    <button class="btn" style="width:100%" onclick="doLogin()">Sign In</button>
-    <div class="login-err" id="login-err"></div>
+    <h2>VJ / TRADING</h2>
+    <p>Options Analytics Terminal — sign in to continue</p>
+    <div class="lf-row"><label>Username</label><input id="l-user" type="text" placeholder="vijay" autocomplete="username"></div>
+    <div class="lf-row"><label>Password</label><input id="l-pass" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+    <div id="login-err"></div>
+    <button class="btn btn-pr" style="width:100%;justify-content:center;margin-top:4px" onclick="doLogin()">Sign In →</button>
   </div>
 </div>
 
-<!-- ── MAIN APP ── -->
 <div id="app" style="display:none">
-  <div class="header">
-    <div class="header-left">
-      <div class="logo">VJ</div>
-      <h1>VJ <span>Trading</span> Dashboard</h1>
-    </div>
-    <div class="header-right">
-      <div class="badge">Sessions: <b id="session-count">0</b></div>
-      <div class="badge">Capital: <b id="latest-capital">—</b></div>
-      <div class="role-badge" id="role-badge">admin</div>
-      <button class="btn" id="add-btn" onclick="openAddModal()">+ Add Session</button>
-      <button class="btn btn-sec" onclick="doLogout()">Logout</button>
-    </div>
+<!-- TOP BAR -->
+<div id="topbar">
+  <div class="tb-left">
+    <div class="brand">VJ / TRADING</div>
+    <div class="tb-badge" id="tb-sess">No session selected</div>
+    <div class="tb-badge" id="tb-capital" style="display:none"></div>
   </div>
-
-  <div class="tab-bar">
-    <div class="tab active" onclick="switchTab('overview',this)">Overview</div>
-    <div class="tab" onclick="switchTab('sessions',this)">All Sessions</div>
-    <div class="tab" onclick="switchTab('detail',this)">Session Detail</div>
-    <div class="tab" onclick="switchTab('scoring',this)">Scoring</div>
-    <div class="tab" onclick="switchTab('upload',this)">Upload CSV</div>
-  </div>
-
-  <div class="content">
-
-    <!-- OVERVIEW -->
-    <div id="panel-overview" class="panel active">
-      <div class="cards-row" id="overview-cards"></div>
-      <div class="chart-wrap"><div class="section-title">Cumulative Net P&L</div><canvas id="equity-chart" height="80"></canvas></div>
-      <div class="chart-wrap"><div class="section-title">Session Score Trend</div><canvas id="score-chart" height="80"></canvas></div>
-    </div>
-
-    <!-- ALL SESSIONS -->
-    <div id="panel-sessions" class="panel">
-      <div class="section-title">All Trading Sessions</div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Index</th><th>VIX</th><th>Capital</th><th>Gross P&L</th><th>Net P&L</th><th>Net ROI</th><th>Charges</th><th>Score</th><th></th></tr></thead>
-        <tbody id="sessions-tbody"></tbody>
-      </table></div>
-    </div>
-
-    <!-- DETAIL -->
-    <div id="panel-detail" class="panel">
-      <div class="session-selector">
-        <label>Session</label>
-        <select id="detail-select" onchange="renderDetail()"></select>
-        <button class="btn btn-sec" id="ai-btn" onclick="generateAI()" style="margin-left:auto">✦ Generate AI Commentary</button>
-      </div>
-      <div id="detail-content"></div>
-      <div id="commentary-section" style="display:none">
-        <div class="section-title">AI Commentary</div>
-        <div class="commentary-box" id="commentary-text"></div>
-      </div>
-    </div>
-
-    <!-- SCORING -->
-    <div id="panel-scoring" class="panel">
-      <div class="session-selector">
-        <label>Session</label>
-        <select id="scoring-select" onchange="renderScoring()"></select>
-      </div>
-      <div id="scoring-content"></div>
-    </div>
-
-    <!-- UPLOAD CSV -->
-    <div id="panel-upload" class="panel">
-      <div class="section-title">Upload Order Book CSV</div>
-      <div class="info-box">
-        <b>How this works:</b> Select a session date, upload your STOXXO order book CSV.
-        The server parses it, computes VWAP per strike, all 5 regulatory charges, and updates the session automatically.
-        Works from any device — phone, office PC, anywhere with internet.
-      </div>
-      <div class="session-selector" style="margin-bottom:16px">
-        <label>Session to update</label>
-        <select id="upload-session-select"></select>
-      </div>
-      <div class="upload-zone" id="upload-zone" onclick="document.getElementById('csv-file').click()" ondragover="event.preventDefault();this.classList.add('drag')" ondragleave="this.classList.remove('drag')" ondrop="handleDrop(event)">
-        <div style="font-size:28px;opacity:.4">📂</div>
-        <p>Click to select CSV or drag &amp; drop here</p>
-        <p id="upload-filename" style="color:var(--accent);margin-top:4px"></p>
-      </div>
-      <input type="file" id="csv-file" accept=".csv" style="display:none" onchange="handleFileSelect(this)">
-      <div style="display:flex;gap:10px;margin-bottom:16px">
-        <div class="form-group" style="flex:1">
-          <label>Capital deployed (₹) for ROI calculation</label>
-          <input type="number" id="upload-capital" placeholder="e.g. 20000000">
-        </div>
-        <div style="display:flex;align-items:flex-end">
-          <button class="btn" id="upload-btn" onclick="uploadCSV()" disabled>Upload &amp; Parse</button>
-        </div>
-      </div>
-      <div id="upload-result" style="display:none"></div>
-    </div>
-
-  </div><!-- .content -->
-</div><!-- #app -->
-
-<!-- ADD SESSION MODAL -->
-<div class="modal-overlay" id="add-modal">
-  <div class="modal">
-    <h2>+ Add New Session</h2>
-    <div class="form-grid">
-      <div class="form-group"><label>Date</label><input type="date" id="f-date"></div>
-      <div class="form-group"><label>Index</label>
-        <select id="f-index"><option>Nifty</option><option>BankNifty</option><option>Sensex</option><option>FinNifty</option></select>
-      </div>
-      <div class="form-group"><label>India VIX</label><input type="number" id="f-vix" placeholder="18.5" step="0.01"></div>
-      <div class="form-group"><label>Capital (₹)</label><input type="number" id="f-capital" placeholder="20000000"></div>
-      <div class="form-group"><label>Gross P&L (₹)</label><input type="number" id="f-gross" placeholder="124423"></div>
-      <div class="form-group"><label>Total Charges (₹)</label><input type="number" id="f-charges" placeholder="4863"></div>
-      <div class="form-group"><label>CE P&L (₹)</label><input type="number" id="f-ce" placeholder="80423"></div>
-      <div class="form-group"><label>PE P&L (₹)</label><input type="number" id="f-pe" placeholder="44000"></div>
-      <div class="form-group"><label>Orders Executed</label><input type="number" id="f-executed" placeholder="151"></div>
-      <div class="form-group"><label>Orders Rejected</label><input type="number" id="f-rejected" placeholder="0"></div>
-      <div class="form-group"><label>Market Toughness (1-10)</label><input type="number" id="f-mt" placeholder="6.85" step="0.01"></div>
-      <div class="form-group"><label>Overall Score (0-100)</label><input type="number" id="f-score" placeholder="71"></div>
-    </div>
-    <div style="margin-top:14px"><div class="form-group">
-      <label>Violations (one per line)</label>
-      <textarea id="f-violations" rows="3" style="resize:vertical"></textarea>
-    </div></div>
-    <div style="margin-top:10px"><div class="form-group">
-      <label>Strengths (one per line)</label>
-      <textarea id="f-strengths" rows="3" style="resize:vertical"></textarea>
-    </div></div>
-    <div class="modal-actions">
-      <button class="btn" onclick="saveSession()">Save to Server</button>
-      <button class="btn btn-sec" onclick="closeAddModal()">Cancel</button>
-    </div>
-    <div id="save-err" style="color:var(--red);font-size:12px;margin-top:8px"></div>
+  <div class="tb-right">
+    <div class="tb-vix" id="tb-vix">VIX —</div>
+    <button class="btn btn-sm" onclick="openAddModal()">+ Add Session</button>
+    <button class="btn btn-sm btn-pr" onclick="setView('upload')">📂 Upload CSV</button>
+    <div class="tb-user" id="tb-user"></div>
+    <button class="btn btn-sm btn-rd" onclick="doLogout()">Logout</button>
+    <div class="ldot"></div>
   </div>
 </div>
 
-<div id="notify"></div>
+<!-- WORKSPACE -->
+<div id="workspace">
+  <div id="sidebar">
+    <div class="sb-section">Analyse</div>
+    <div class="sb-item active" id="nav-upload" onclick="setView('upload')"><span class="sb-ico">⬆</span>Upload CSV</div>
+    <div class="sb-item" id="nav-overview" onclick="setView('overview')"><span class="sb-ico">▦</span>Overview</div>
+    <div class="sb-item" id="nav-strikes" onclick="setView('strikes')"><span class="sb-ico">⊞</span>Strike P&L</div>
+    <div class="sb-item" id="nav-scoring" onclick="setView('scoring')"><span class="sb-ico">◎</span>Scoring</div>
+    <div class="sb-item" id="nav-charges" onclick="setView('charges')"><span class="sb-ico">₹</span>Charges</div>
+    <div class="sb-item" id="nav-journal" onclick="setView('journal')"><span class="sb-ico">📝</span>Journal</div>
+    <div class="sb-section">History</div>
+    <div class="sb-item" id="nav-sessions" onclick="setView('sessions')"><span class="sb-ico">⋮⋮</span>Sessions<span class="sb-cnt" id="sess-count">0</span></div>
+    <div class="sb-item" id="nav-trends" onclick="setView('trends')"><span class="sb-ico">↗</span>Trends</div>
+    <div class="sb-section">Config</div>
+    <div class="sb-item" id="nav-rules" onclick="setView('rules')"><span class="sb-ico">✦</span>Rules</div>
+  </div>
+
+  <div id="main">
+    <div class="card"><div class="card-title">Loading…</div></div>
+  </div>
+</div>
+</div>
+
+<!-- ADD/EDIT MODAL -->
+<div class="modal-bg" id="modal-bg" style="display:none" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-title" id="modal-title">Add Session<button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast-wrap"></div>
 
 <script>
-// ══════════════════════════════════════
-//  CONFIG
-// ══════════════════════════════════════
-const API = '';  // Empty = same domain. Works automatically on Railway.
+// ══════════════════════════════════════════════════════════════
+//  API LAYER (replaces localStorage)
+// ══════════════════════════════════════════════════════════════
 const TOKEN_KEY = 'vj_token';
 const ROLE_KEY  = 'vj_role';
+const USER_KEY  = 'vj_user';
 
-let sessions  = [];
-let userRole  = '';
-let csvFile   = null;
+let SESSIONS = [];
+let CUR = null;
+let CHARTS = {};
+let CUR_VIEW = 'upload';
+let USER_ROLE = 'readonly';
 
-// ══════════════════════════════════════
-//  API HELPERS
-// ══════════════════════════════════════
-function getToken() { return localStorage.getItem(TOKEN_KEY); }
+// RAW CSV state
+let RAW = { trades:[], agg:{}, carry:{}, metrics:null, chartFile:null };
 
-async function apiFetch(path, opts = {}) {
+const getToken = () => localStorage.getItem(TOKEN_KEY);
+
+async function apiFetch(path, opts={}) {
   const token = getToken();
-  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const headers = { ...opts.headers };
   if (token) headers['Authorization'] = `Bearer ${token}`;
-
-  const res = await fetch(API + path, { ...opts, headers });
+  if (!(opts.body instanceof FormData)) headers['Content-Type'] = 'application/json';
+  const res = await fetch(path, { ...opts, headers });
   if (res.status === 401) { doLogout(); return null; }
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || 'API error');
+    const e = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(e.detail || 'API error');
   }
   return res.json();
 }
 
-// ══════════════════════════════════════
-//  AUTH
-// ══════════════════════════════════════
+async function loadSessions() {
+  const data = await apiFetch('/sessions');
+  if (!data) return;
+  // Normalize API response to match dashboard's field names
+  SESSIONS = data.map(s => ({
+    ...s,
+    index: s.index || s.index_name,
+    peer_rois: s.peer_rois || [],
+    scores: s.scores || {overall:0,discipline:0,cap_eff:0,trade_q:0,mkt_align:0,vol_handle:0,peer_cmp:0},
+    violations: s.violations || [],
+    strengths: s.strengths || [],
+    positions: s.strikes ? s.strikes.map(st => ({
+      sym: st.symbol, strike: `${st.strike}${st.option_type}`,
+      side: st.sell_qty > st.buy_qty ? 'SHORT' : 'LONG',
+      entry: st.sell_qty > st.buy_qty ? st.sell_vwap : st.buy_vwap,
+      exit:  st.sell_qty > st.buy_qty ? st.buy_vwap  : st.sell_vwap,
+      qty: Math.max(st.buy_qty, st.sell_qty),
+      pnl: st.realized,
+      open: st.is_carry
+    })) : (s.positions || []),
+    time_pnl: s.time_pnl || {},
+    carry_out: s.carry_out || 0,
+    dte: s.dte || 0,
+    chart_img: s.chart_image || null,
+    charges_breakdown: s.charges_breakdown || {},
+  }));
+  SESSIONS.sort((a,b) => b.id.localeCompare(a.id));
+  updateSessCount();
+}
+
+async function saveSession(sess) {
+  // Map dashboard fields to API schema
+  const body = {
+    id: sess.id,
+    date: sess.date,
+    full: sess.full,
+    index_name: sess.index || sess.index_name || 'Nifty',
+    dte: sess.dte || 0,
+    vix: sess.vix || null,
+    capital: sess.capital || null,
+    gross_pnl: sess.gross_pnl || null,
+    net_pnl: sess.net_pnl || null,
+    net_roi: sess.net_roi || null,
+    gross_roi: sess.gross_roi || null,
+    ce_pnl: sess.ce_pnl || null,
+    pe_pnl: sess.pe_pnl || null,
+    charges: sess.charges || null,
+    executed: sess.executed || null,
+    rejected: sess.rejected || null,
+    mt: sess.mt || null,
+    carry_out: sess.carry_out || 0,
+    note: sess.notes || sess.note || null,
+    journal: sess.journal || null,
+    peer_rois: sess.peer_rois || [],
+    scores: sess.scores || {overall:0,discipline:0,cap_eff:0,trade_q:0,mkt_align:0,vol_handle:0,peer_cmp:0},
+    violations: sess.violations || [],
+    strengths: sess.strengths || [],
+  };
+  return apiFetch('/sessions', { method:'POST', body: JSON.stringify(body) });
+}
+
+async function deleteSessionAPI(id) {
+  return apiFetch(`/sessions/${id}`, { method:'DELETE' });
+}
+
+// ── AUTH ─────────────────────────────────────────────────────
 async function doLogin() {
   const username = document.getElementById('l-user').value.trim();
   const password = document.getElementById('l-pass').value;
-  const errEl    = document.getElementById('login-err');
-  errEl.textContent = '';
-
+  document.getElementById('login-err').textContent = '';
   try {
-    const data = await apiFetch('/auth/token', {
-      method: 'POST',
-      body: JSON.stringify({ username, password })
-    });
+    const data = await apiFetch('/auth/token', { method:'POST', body:JSON.stringify({username,password}) });
     if (!data) return;
     localStorage.setItem(TOKEN_KEY, data.access_token);
-
-    // Get role
     const me = await apiFetch('/auth/me');
     localStorage.setItem(ROLE_KEY, me.role);
-    userRole = me.role;
-
+    localStorage.setItem(USER_KEY, me.username);
+    USER_ROLE = me.role;
     await bootApp();
   } catch(e) {
-    errEl.textContent = e.message || 'Login failed';
+    document.getElementById('login-err').textContent = e.message || 'Login failed';
   }
 }
+document.getElementById('l-pass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
 
 function doLogout() {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(ROLE_KEY);
+  localStorage.removeItem(USER_KEY);
   document.getElementById('app').style.display = 'none';
-  document.getElementById('login-screen').style.display = 'flex';
-  document.getElementById('loading').classList.add('hidden');
+  document.getElementById('login-overlay').style.display = 'flex';
 }
 
-// ══════════════════════════════════════
-//  BOOT
-// ══════════════════════════════════════
 async function bootApp() {
-  document.getElementById('login-screen').style.display = 'none';
-  document.getElementById('loading').classList.remove('hidden');
-  document.getElementById('load-msg').textContent = 'Loading sessions…';
+  document.getElementById('login-overlay').style.display = 'none';
+  document.getElementById('app').style.display = 'flex';
+  USER_ROLE = localStorage.getItem(ROLE_KEY) || 'readonly';
+  const username = localStorage.getItem(USER_KEY) || '';
+  document.getElementById('tb-user').textContent = `${username} [${USER_ROLE}]`;
+  // Show/hide admin-only controls
+  const adminOnly = USER_ROLE === 'admin';
+  document.querySelectorAll('.admin-only').forEach(el => el.style.display = adminOnly ? '' : 'none');
 
-  try {
-    sessions = await apiFetch('/sessions');
-    if (!sessions) return;
-
-    userRole = localStorage.getItem(ROLE_KEY) || 'readonly';
-    document.getElementById('role-badge').textContent = userRole;
-    document.getElementById('add-btn').style.display = userRole === 'admin' ? '' : 'none';
-
-    populateSelects();
-    renderOverview();
-    document.getElementById('loading').classList.add('hidden');
-    document.getElementById('app').style.display = 'block';
-  } catch(e) {
-    document.getElementById('load-msg').textContent = 'Could not connect to server. Check Railway is running.';
-  }
+  await loadSessions();
+  if (SESSIONS.length) CUR = SESSIONS[0];
+  renderView();
 }
 
-// On page load — check existing token
 window.addEventListener('load', async () => {
-  const token = getToken();
-  if (token) {
-    await bootApp();
-    if (document.getElementById('app').style.display === 'none') {
-      // bootApp failed or logged out
-      document.getElementById('loading').classList.add('hidden');
-      document.getElementById('login-screen').style.display = 'flex';
+  if (getToken()) {
+    try { await bootApp(); }
+    catch(e) {
+      localStorage.removeItem(TOKEN_KEY);
+      document.getElementById('login-overlay').style.display = 'flex';
     }
-  } else {
-    document.getElementById('loading').classList.add('hidden');
-    document.getElementById('login-screen').style.display = 'flex';
   }
 });
 
-// ══════════════════════════════════════
-//  HELPERS
-// ══════════════════════════════════════
-function fmtCr(v) {
-  if (v == null) return '—';
-  const cr = Math.abs(v) / 1e7;
-  const sign = v < 0 ? '-' : '';
-  if (cr >= 1) return sign + '₹' + cr.toFixed(2) + 'Cr';
-  return sign + '₹' + (Math.abs(v)/1e5).toFixed(2) + 'L';
-}
-function fmtPnl(v) {
-  if (v == null) return '<span style="color:var(--muted)">—</span>';
-  return `<span class="${v>=0?'green':'red'}">${fmtCr(v)}</span>`;
-}
-function fmtRoi(v) {
-  if (v == null) return '<span style="color:var(--muted)">—</span>';
-  return `<span class="${v>=0?'green':'red'}">${v>=0?'+':''}${v.toFixed(3)}%</span>`;
-}
-function scoreColor(s) {
-  return s >= 75 ? '#10b981' : s >= 55 ? '#f59e0b' : '#ef4444';
+// ── UPSERT LOCAL CACHE ────────────────────────────────────────
+function upsertLocal(sess) {
+  const idx = SESSIONS.findIndex(s => s.id === sess.id);
+  if (idx >= 0) SESSIONS[idx] = sess;
+  else SESSIONS.unshift(sess);
+  SESSIONS.sort((a,b) => b.id.localeCompare(a.id));
+  CUR = SESSIONS.find(s => s.id === sess.id);
+  updateSessCount();
 }
 
-function notify(msg, isError=false) {
-  const el = document.getElementById('notify');
-  el.textContent = msg;
-  el.className = isError ? 'error show' : 'show';
-  setTimeout(() => el.className = '', 3000);
+function updateSessCount() {
+  document.getElementById('sess-count').textContent = SESSIONS.length;
 }
 
-// ══════════════════════════════════════
-//  TABS
-// ══════════════════════════════════════
-function switchTab(name, el) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  el.classList.add('active');
-  document.getElementById('panel-' + name).classList.add('active');
-  if (name === 'overview')  renderOverview();
-  if (name === 'sessions')  renderSessionsTable();
-  if (name === 'detail')    renderDetail();
-  if (name === 'scoring')   renderScoring();
-  if (name === 'upload')    renderUploadTab();
-}
-
-// ══════════════════════════════════════
-//  OVERVIEW
-// ══════════════════════════════════════
-function renderOverview() {
-  const valid = sessions.filter(s => s.net_pnl != null);
-  const totalNet = valid.reduce((a,b) => a + b.net_pnl, 0);
-  const wins = valid.filter(s => s.net_pnl > 0).length;
-  const avgScore = sessions.length ? sessions.reduce((a,b) => a + (b.scores?.overall||0), 0) / sessions.length : 0;
-  const bestS = valid.length ? valid.reduce((a,b) => a.net_pnl > b.net_pnl ? a : b) : null;
-  const latestCap = sessions.length ? sessions[sessions.length-1].capital : null;
-
-  document.getElementById('session-count').textContent = sessions.length;
-  document.getElementById('latest-capital').textContent = latestCap ? fmtCr(latestCap).replace('₹','') : '—';
-
-  document.getElementById('overview-cards').innerHTML = `
-    <div class="card"><div class="card-label">Total Net P&L</div><div class="card-value ${totalNet>=0?'green':'red'}">${fmtCr(totalNet)}</div><div class="card-sub">${valid.length} sessions with data</div></div>
-    <div class="card"><div class="card-label">Win Rate</div><div class="card-value accent">${valid.length?Math.round(wins/valid.length*100):'—'}%</div><div class="card-sub">${wins}W / ${valid.length-wins}L</div></div>
-    <div class="card"><div class="card-label">Avg Score</div><div class="card-value" style="color:${scoreColor(avgScore)}">${avgScore.toFixed(0)}/100</div><div class="card-sub">${sessions.length} sessions</div></div>
-    <div class="card"><div class="card-label">Best Session</div><div class="card-value green">${bestS?fmtCr(bestS.net_pnl):'—'}</div><div class="card-sub">${bestS?bestS.full:'—'}</div></div>
-    <div class="card"><div class="card-label">Total Charges</div><div class="card-value yellow">${fmtCr(valid.reduce((a,b)=>a+(b.charges||0),0))}</div><div class="card-sub">All sessions</div></div>
-    <div class="card"><div class="card-label">Sessions</div><div class="card-value accent">${sessions.length}</div><div class="card-sub">${sessions.filter(s=>s.index==='Nifty').length}N · ${sessions.filter(s=>s.index==='BankNifty').length}BN · ${sessions.filter(s=>s.index==='Sensex').length}Sx</div></div>
-  `;
-  drawEquityChart();
-  drawScoreChart();
-}
-
-function drawEquityChart() {
-  const canvas = document.getElementById('equity-chart');
-  const ctx = canvas.getContext('2d');
-  const valid = sessions.filter(s => s.net_pnl != null);
-  if (!valid.length) return;
-  canvas.width = canvas.parentElement.offsetWidth - 44;
-  canvas.height = 150;
-  const W = canvas.width, H = canvas.height;
-  const pad = {l:72,r:24,t:20,b:38};
-  let cum = 0;
-  const pts = valid.map(s => { cum += s.net_pnl; return {label:s.date, val:cum}; });
-  const vals = pts.map(p => p.val);
-  const minV = Math.min(0, ...vals), maxV = Math.max(...vals);
-  const range = maxV - minV || 1;
-  ctx.clearRect(0,0,W,H);
-  const toX = i => pad.l + (i/(pts.length-1||1)) * (W-pad.l-pad.r);
-  const toY = v => pad.t + (1-(v-minV)/range) * (H-pad.t-pad.b);
-  const zy = toY(0);
-  ctx.strokeStyle='#1e2d45';ctx.lineWidth=1;ctx.setLineDash([4,4]);
-  ctx.beginPath();ctx.moveTo(pad.l,zy);ctx.lineTo(W-pad.r,zy);ctx.stroke();
-  ctx.setLineDash([]);
-  const grad = ctx.createLinearGradient(0,pad.t,0,H-pad.b);
-  grad.addColorStop(0,'rgba(0,212,255,.28)');grad.addColorStop(1,'rgba(0,212,255,.02)');
-  ctx.beginPath();
-  pts.forEach((p,i) => i===0?ctx.moveTo(toX(i),toY(p.val)):ctx.lineTo(toX(i),toY(p.val)));
-  ctx.lineTo(toX(pts.length-1),H-pad.b);ctx.lineTo(pad.l,H-pad.b);
-  ctx.fillStyle=grad;ctx.fill();
-  ctx.beginPath();ctx.strokeStyle='#00d4ff';ctx.lineWidth=2.5;
-  pts.forEach((p,i) => i===0?ctx.moveTo(toX(i),toY(p.val)):ctx.lineTo(toX(i),toY(p.val)));
-  ctx.stroke();
-  pts.forEach((p,i) => {
-    ctx.beginPath();ctx.arc(toX(i),toY(p.val),4,0,Math.PI*2);
-    ctx.fillStyle=p.val>=0?'#10b981':'#ef4444';ctx.fill();
-    ctx.fillStyle='#64748b';ctx.font='11px Segoe UI';ctx.textAlign='center';
-    ctx.fillText(p.label,toX(i),H-pad.b+14);
-    if(i===pts.length-1){ctx.fillStyle=p.val>=0?'#10b981':'#ef4444';ctx.font='bold 11px Segoe UI';ctx.textAlign='left';ctx.fillText(fmtCr(p.val),toX(i)+6,toY(p.val)-5);}
-  });
-  ctx.fillStyle='#64748b';ctx.font='11px Segoe UI';ctx.textAlign='right';
-  [minV,(minV+maxV)/2,maxV].forEach(v=>{ctx.fillText(fmtCr(v),pad.l-6,toY(v)+4);});
-}
-
-function drawScoreChart() {
-  const canvas = document.getElementById('score-chart');
-  const ctx = canvas.getContext('2d');
-  canvas.width = canvas.parentElement.offsetWidth - 44;
-  canvas.height = 130;
-  const W = canvas.width, H = canvas.height;
-  const pad = {l:36,r:20,t:18,b:38};
-  ctx.clearRect(0,0,W,H);
-  const spacing = (W-pad.l-pad.r)/sessions.length;
-  const barW = Math.min(55, spacing - 10);
-  sessions.forEach((s,i) => {
-    const score = s.scores?.overall || 0;
-    const x = pad.l + i*spacing + spacing/2 - barW/2;
-    const barH = (score/100)*(H-pad.t-pad.b);
-    const y = H-pad.b-barH;
-    const color = scoreColor(score);
-    const gr = ctx.createLinearGradient(0,y,0,H-pad.b);
-    gr.addColorStop(0,color);gr.addColorStop(1,color+'44');
-    ctx.fillStyle=gr;ctx.beginPath();ctx.roundRect(x,y,barW,barH,4);ctx.fill();
-    ctx.fillStyle=color;ctx.font='bold 11px Segoe UI';ctx.textAlign='center';
-    ctx.fillText(score,x+barW/2,y-5);
-    ctx.fillStyle='#64748b';ctx.font='11px Segoe UI';
-    ctx.fillText(s.date,x+barW/2,H-pad.b+14);
-  });
-  [55,75].forEach(v => {
-    const y = H-pad.b-(v/100)*(H-pad.t-pad.b);
-    ctx.strokeStyle=v===75?'#10b981':'#f59e0b';ctx.lineWidth=1;ctx.setLineDash([4,4]);
-    ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();
-    ctx.setLineDash([]);
-  });
-}
-
-// ══════════════════════════════════════
-//  SESSIONS TABLE
-// ══════════════════════════════════════
-function renderSessionsTable() {
-  document.getElementById('sessions-tbody').innerHTML = sessions.map(s => `
-    <tr>
-      <td><b>${s.full||s.date}</b></td>
-      <td><span style="color:var(--accent)">${s.index||s.index_name}</span></td>
-      <td>${s.vix!=null?s.vix.toFixed(2):'—'}</td>
-      <td>${fmtCr(s.capital)}</td>
-      <td>${fmtPnl(s.gross_pnl)}</td>
-      <td>${fmtPnl(s.net_pnl)}</td>
-      <td>${fmtRoi(s.net_roi)}</td>
-      <td>${s.charges!=null?'<span class="yellow">'+fmtCr(s.charges)+'</span>':'—'}</td>
-      <td><b style="color:${scoreColor(s.scores?.overall||0)}">${s.scores?.overall||'—'}</b>/100</td>
-      <td><button class="btn btn-sec" style="padding:3px 10px;font-size:12px" onclick="goDetail('${s.id}')">View</button></td>
-    </tr>`).join('');
-}
-
-function goDetail(id) {
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.tab')[2].classList.add('active');
-  document.getElementById('panel-detail').classList.add('active');
-  document.getElementById('detail-select').value = id;
-  renderDetail();
-}
-
-// ══════════════════════════════════════
-//  DETAIL
-// ══════════════════════════════════════
-function renderDetail() {
-  const id = document.getElementById('detail-select').value;
-  const s = sessions.find(x => x.id === id);
-  if (!s) return;
-  document.getElementById('commentary-section').style.display = 'none';
-  if (s.ai_commentary) {
-    document.getElementById('commentary-text').textContent = s.ai_commentary;
-    document.getElementById('commentary-section').style.display = 'block';
-  }
-  document.getElementById('detail-content').innerHTML = `
-    <div class="cards-row">
-      <div class="card"><div class="card-label">Gross P&L</div><div class="card-value ${(s.gross_pnl||0)>=0?'green':'red'}">${fmtCr(s.gross_pnl)}</div></div>
-      <div class="card"><div class="card-label">Net P&L</div><div class="card-value ${(s.net_pnl||0)>=0?'green':'red'}">${fmtCr(s.net_pnl)}</div></div>
-      <div class="card"><div class="card-label">Net ROI</div><div class="card-value ${(s.net_roi||0)>=0?'green':'red'}">${s.net_roi!=null?(s.net_roi>=0?'+':'')+s.net_roi.toFixed(3)+'%':'—'}</div></div>
-      <div class="card"><div class="card-label">Charges</div><div class="card-value yellow">${fmtCr(s.charges)}</div></div>
-      <div class="card"><div class="card-label">VIX</div><div class="card-value accent">${s.vix!=null?s.vix.toFixed(2):'—'}</div></div>
-      <div class="card"><div class="card-label">Capital</div><div class="card-value">${fmtCr(s.capital)}</div></div>
-      <div class="card"><div class="card-label">CE P&L</div><div class="card-value ${(s.ce_pnl||0)>=0?'green':'red'}">${fmtCr(s.ce_pnl)}</div></div>
-      <div class="card"><div class="card-label">PE P&L</div><div class="card-value ${(s.pe_pnl||0)>=0?'green':'red'}">${fmtCr(s.pe_pnl)}</div></div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:20px">
-      <div><div class="section-title">Violations</div>${(s.violations||[]).map(v=>`<div class="list-item violation">${v}</div>`).join('')||'<div class="list-item violation" style="opacity:.5">None recorded</div>'}</div>
-      <div><div class="section-title">Strengths</div>${(s.strengths||[]).map(v=>`<div class="list-item strength">${v}</div>`).join('')||'<div class="list-item strength" style="opacity:.5">None recorded</div>'}</div>
-    </div>
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px">
-      <div class="card"><div class="card-label">Market Toughness</div><div class="card-value accent">${s.mt!=null?s.mt.toFixed(2):'—'}/10</div></div>
-      <div class="card"><div class="card-label">Executions</div><div class="card-value">${s.executed!=null?s.executed:'—'}</div><div class="card-sub">${s.rejected!=null?s.rejected+' rejected':''}</div></div>
-      <div class="card"><div class="card-label">Carry Out</div><div class="card-value ${(s.carry_out||0)>0?'yellow':'green'}">${s.carry_out!=null?s.carry_out+' legs':'—'}</div></div>
-    </div>
-    ${s.note?`<div class="info-box" style="margin-top:14px"><b>Note:</b> ${s.note}</div>`:''}
-  `;
-}
-
-// ══════════════════════════════════════
-//  AI COMMENTARY
-// ══════════════════════════════════════
-async function generateAI() {
-  if (userRole !== 'admin') { notify('Admin only', true); return; }
-  const id = document.getElementById('detail-select').value;
-  const btn = document.getElementById('ai-btn');
-  btn.innerHTML = '<span class="spinner"></span>Generating…';
-  btn.disabled = true;
+async function deleteSession(id) {
+  if (!confirm('Delete this session? Cannot be undone.')) return;
   try {
-    const data = await apiFetch(`/ai-commentary/${id}`, { method: 'POST' });
-    // Refresh sessions
-    sessions = await apiFetch('/sessions');
-    renderDetail();
-    notify('AI commentary generated!');
-  } catch(e) {
-    notify(e.message, true);
-  } finally {
-    btn.innerHTML = '✦ Generate AI Commentary';
-    btn.disabled = false;
-  }
+    await deleteSessionAPI(id);
+    SESSIONS = SESSIONS.filter(s => s.id !== id);
+    if (CUR && CUR.id === id) CUR = SESSIONS[0] || null;
+    updateSessCount();
+    renderView();
+    toast('Session deleted', 'ok');
+  } catch(e) { toast(e.message, 'err'); }
 }
 
-// ══════════════════════════════════════
-//  SCORING
-// ══════════════════════════════════════
-function renderScoring() {
-  const id = document.getElementById('scoring-select').value;
-  const s = sessions.find(x => x.id === id);
-  if (!s || !s.scores) return;
-  const sc = s.scores;
-  const dims = [
-    {key:'discipline',  label:'Discipline',          w:25},
-    {key:'cap_eff',     label:'Capital Efficiency',  w:20},
-    {key:'trade_q',     label:'Trade Quality',       w:20},
-    {key:'mkt_align',   label:'Market Alignment',    w:15},
-    {key:'vol_handle',  label:'Volatility Handling', w:10},
-    {key:'peer_cmp',    label:'Peer Comparison',     w:10},
-  ];
-  document.getElementById('scoring-content').innerHTML = `
-    <div class="cards-row" style="grid-template-columns:repeat(3,1fr)">
-      <div class="card"><div class="card-label">Overall Score</div><div class="card-value" style="color:${scoreColor(sc.overall||0)}">${sc.overall||'—'}/100</div><div class="card-sub">${(sc.overall||0)>=75?'🟢 Good':(sc.overall||0)>=55?'🟡 Average':'🔴 Below Par'}</div></div>
-      <div class="card"><div class="card-label">Market Toughness</div><div class="card-value accent">${s.mt!=null?s.mt.toFixed(2):'—'}/10</div></div>
-      <div class="card"><div class="card-label">Session</div><div class="card-value">${s.date}</div><div class="card-sub">${s.index||s.index_name} Expiry</div></div>
+// ══════════════════════════════════════════════════════════════
+//  ROUTING
+// ══════════════════════════════════════════════════════════════
+const VIEWS = ['upload','overview','strikes','scoring','charges','journal','sessions','trends','rules'];
+
+function setView(v) {
+  if (!VIEWS.includes(v)) return;
+  CUR_VIEW = v;
+  VIEWS.forEach(n => {
+    const el = document.getElementById('nav-'+n);
+    if (el) el.classList.toggle('active', n === v);
+  });
+  renderView();
+}
+
+function renderView() {
+  destroyCharts();
+  const fn = {
+    upload:vUpload, overview:vOverview, strikes:vStrikes,
+    scoring:vScoring, charges:vCharges, journal:vJournal,
+    sessions:vSessions, trends:vTrends, rules:vRules
+  }[CUR_VIEW];
+  document.getElementById('main').innerHTML = fn ? fn() : '<div class="empty"><span class="empty-ico">🚧</span><div class="empty-txt">Coming soon</div></div>';
+  afterRender();
+}
+
+function destroyCharts() {
+  Object.values(CHARTS).forEach(c => { try { c.destroy(); } catch(e) {} });
+  CHARTS = {};
+}
+
+function afterRender() {
+  updateTopbar();
+  if (CUR_VIEW === 'overview') buildOverviewCharts();
+  if (CUR_VIEW === 'scoring')  buildScoringCharts();
+  if (CUR_VIEW === 'trends')   buildTrendCharts();
+  if (CUR_VIEW === 'journal')  bindJournalEvents();
+}
+
+function updateTopbar() {
+  const s = CUR;
+  document.getElementById('tb-sess').textContent = s ? `${s.full} · ${s.index} · DTE=${s.dte}` : 'No session selected';
+  document.getElementById('tb-vix').textContent = s ? `VIX ${s.vix}` : 'VIX —';
+  const cap = document.getElementById('tb-capital');
+  if (s) { cap.style.display=''; cap.textContent = `₹${fmtCr(s.capital)}`; }
+  else cap.style.display = 'none';
+}
+
+// ══════════════════════════════════════════════════════════════
+//  UPLOAD VIEW
+// ══════════════════════════════════════════════════════════════
+function vUpload() {
+  const hasData = RAW.trades.length > 0;
+  return `
+    <div class="card">
+      <div class="card-title">Upload Order Book CSV</div>
+      <div id="drop-zone" onclick="document.getElementById('csv-inp').click()"
+           ondragover="event.preventDefault();this.classList.add('drag')"
+           ondragleave="this.classList.remove('drag')"
+           ondrop="handleDrop(event)">
+        <span class="dz-ico">📄</span>
+        <div class="dz-txt">Drop broker CSV here or click to browse</div>
+        <div class="dz-sub">Supports: Zerodha, XTS/STOXXO, Jainam, Upstox order book formats</div>
+        <input type="file" id="csv-inp" accept=".csv" style="display:none" onchange="handleFileInput(this)">
+      </div>
+      ${!hasData ? `<div style="margin-top:10px;text-align:center"><button class="btn btn-sm" onclick="loadSampleCSV()">Load sample data</button></div>` : ''}
     </div>
-    <div class="chart-wrap">
-      <div class="section-title">Six-Dimension Breakdown</div>
-      <div style="padding:6px 0">
-        ${dims.map(d=>{const raw=sc[d.key]||0;const color=scoreColor(raw);return`
-        <div class="score-row">
-          <div class="score-label">${d.label}<span style="color:var(--muted);font-size:11px"> (${d.w}%)</span></div>
-          <div class="score-bar-bg"><div class="score-bar-fill" style="width:${raw}%;background:linear-gradient(90deg,${color},${color}88)"></div></div>
-          <div class="score-num" style="color:${color}">${raw}</div>
-        </div>`;}).join('')}
+    ${hasData ? renderCfgStrip() : ''}
+    ${hasData && Object.keys(RAW.carry).length > 0 ? renderCarryPanel() : ''}
+    ${hasData ? renderUploadResults() : ''}
+  `;
+}
+
+function renderCfgStrip() {
+  const cfg = RAW.metrics || {};
+  return `
+    <div id="cfg-strip">
+      <div class="form-row"><label>India VIX</label>
+        <input type="number" id="cfg-vix" value="${cfg.vix||''}" step="0.1" min="5" max="50" placeholder="e.g. 18.5" oninput="recompute()"></div>
+      <div class="form-row"><label>DTE</label>
+        <select id="cfg-dte" onchange="recompute()">${[0,1,2,3,4,5].map(d=>`<option value="${d}"${(cfg.dte||0)==d?' selected':''}>${d}</option>`).join('')}</select></div>
+      <div class="form-row"><label>Capital (₹)</label>
+        <input type="number" id="cfg-capital" value="${cfg.capital||20000000}" step="100000" oninput="recompute()"></div>
+      <div class="form-row"><label>Session char.</label>
+        <select id="cfg-char" onchange="recompute()"><option value="range">Range</option><option value="trend">Trend</option><option value="vrecovery">V-recovery</option><option value="gaptrend">Gap+Trend</option></select></div>
+      <div class="form-row"><label>Context</label>
+        <select id="cfg-ctx" onchange="recompute()"><option value="normal">Normal</option><option value="postevent">Post-event</option><option value="macro">Macro</option><option value="crash">Crash</option></select></div>
+      <div class="form-row"><label>Brokerage/lot ₹</label>
+        <input type="number" id="cfg-brok" value="${cfg.brokerage||0}" step="10" min="0" oninput="recompute()"></div>
+    </div>
+    <div class="card" style="margin-top:0">
+      <div class="card-title">Peer ROIs <span class="card-badge">comma-separated %</span></div>
+      <input type="text" id="cfg-peers" value="${(cfg.peer_rois||[]).join(',')}" placeholder="e.g. 0.25, 0.50, -0.10" oninput="recompute()">
+    </div>`;
+}
+
+function renderCarryPanel() {
+  const carry = RAW.carry;
+  return `
+    <div id="carry-panel">
+      <div class="card-title" style="color:var(--am)">⚠ Carry Positions Detected — Enter Previous Session Entry Prices</div>
+      ${Object.keys(carry).map(sym => {
+        const side = carry[sym].side, qty = carry[sym].qty;
+        return `<div class="carry-row">
+          <div class="carry-sym">${sym}</div>
+          <div class="carry-side"><span class="badge ${side==='BUY'?'b-gr':'b-rd'}">${side}</span></div>
+          <div class="carry-qty">${qty} qty</div>
+          <input type="number" id="carry-${sym}" placeholder="Entry price" step="0.01" style="width:130px" oninput="recompute()">
+          <select id="carrytype-${sym}" style="width:110px" onchange="recompute()"><option value="close">Close today</option><option value="open">Keep open</option></select>
+        </div>`;
+      }).join('')}
+      <div class="btn-row" style="margin-top:10px">
+        <button class="btn btn-sm" onclick="skipCarry()">Mark all as OPEN (unrealized)</button>
+      </div>
+    </div>`;
+}
+
+function renderUploadResults() {
+  const m = RAW.metrics;
+  if (!m) return '';
+  const grossRoi = (m.gross_pnl/m.capital*100).toFixed(4);
+  const netRoi = (m.net_pnl/m.capital*100).toFixed(4);
+  const cr = m.gross_pnl > 0 ? (m.charges/m.gross_pnl*100).toFixed(1) : 'N/A';
+  return `
+    <div class="grid4">
+      <div class="mc"><div class="mc-lbl">Gross P&L</div>
+        <div class="mc-val ${m.gross_pnl>=0?'pos':'neg'}">${fmtInr(m.gross_pnl)}</div>
+        <div class="mc-sub">${grossRoi}% of capital</div></div>
+      <div class="mc"><div class="mc-lbl">Net P&L</div>
+        <div class="mc-val ${m.net_pnl>=0?'pos':'neg'}">${fmtInr(m.net_pnl)}</div>
+        <div class="mc-sub">After ₹${Math.round(m.charges).toLocaleString('en-IN')} charges</div></div>
+      <div class="mc"><div class="mc-lbl">Charge Ratio</div>
+        <div class="mc-val neu">${cr}%</div>
+        <div class="mc-sub">of gross P&L</div></div>
+      <div class="mc"><div class="mc-lbl">Trades</div>
+        <div class="mc-val">${m.executed}</div>
+        <div class="mc-sub">${m.rejected} rejected</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Strike-wise P&L</div>
+      <table class="tbl">
+        <thead><tr><th>Symbol</th><th>Type</th><th>Sell Avg</th><th>Buy Avg</th><th>Qty</th><th>P&L</th><th>Status</th></tr></thead>
+        <tbody>
+          ${Object.entries(m.positions).map(([sym,p]) => `
+            <tr>
+              <td class="fm" style="font-size:11px">${sym}</td>
+              <td><span class="badge ${sym.endsWith('CE')?'b-rd':'b-gr'}">${sym.endsWith('CE')?'CE':'PE'}</span></td>
+              <td class="fm">${p.sa>0?'₹'+p.sa.toFixed(2):'—'}</td>
+              <td class="fm">${p.ba>0?'₹'+p.ba.toFixed(2):'—'}</td>
+              <td class="fm">${Math.max(p.sq,p.bq)}</td>
+              <td class="fm ${p.pnl>=0?'pos':'neg'}">${fmtInr(p.pnl)}</td>
+              <td><span class="badge ${p.open?'b-am':'b-bl'}">${p.open?'OPEN':'CLOSED'}</span></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="card-title">Upload Chart Screenshot <span class="card-badge">optional</span></div>
+      <div style="display:flex;gap:12px;align-items:flex-start">
+        <div><button class="btn btn-sm" onclick="document.getElementById('chart-img-inp').click()">📷 Choose Image</button>
+          <input type="file" id="chart-img-inp" accept="image/*" style="display:none" onchange="handleChartImg(this)"></div>
+        <div class="chart-img-wrap" id="chart-preview" style="flex:1;min-height:50px">
+          ${RAW.chartFile?`<img src="${RAW.chartFile}" alt="chart">`:'<span style="font-size:11px;color:var(--tx3)">No image uploaded</span>'}
+        </div>
       </div>
     </div>
-  `;
+    <div class="card admin-only">
+      <div class="card-title">Save to Server</div>
+      <div class="form-grid" style="grid-template-columns:1fr 1fr 1fr">
+        <div class="form-row"><label>Date</label><input type="text" id="save-date" value="${m.date_id||getTodayId()}" placeholder="YYYY-MM-DD"></div>
+        <div class="form-row"><label>Index</label>
+          <select id="save-index">${['Nifty','BankNifty','Sensex','FinNifty','Nifty+Sensex','Nifty+BankNifty'].map(i=>`<option${i===m.index?' selected':''}>${i}</option>`).join('')}</select></div>
+        <div class="form-row"><label>Notes (optional)</label><input type="text" id="save-notes" placeholder="e.g. expiry week"></div>
+      </div>
+      <div class="btn-row" style="margin-top:12px">
+        <button class="btn btn-gr" onclick="saveFromUpload()">💾 Save to Server</button>
+        <button class="btn btn-sm btn-rd" onclick="resetUpload()">✕ Clear</button>
+      </div>
+    </div>`;
 }
 
-// ══════════════════════════════════════
-//  UPLOAD CSV TAB
-// ══════════════════════════════════════
-function renderUploadTab() {
-  const sel = document.getElementById('upload-session-select');
-  sel.innerHTML = sessions.map(s => `<option value="${s.id}">${s.full||s.date} — ${s.index||s.index_name}</option>`).join('');
-  // Add "New session" option
-  const newOpt = document.createElement('option');
-  newOpt.value = 'new';
-  newOpt.textContent = '+ New session (date from filename)';
-  sel.insertBefore(newOpt, sel.firstChild);
-}
-
-function handleFileSelect(input) {
-  csvFile = input.files[0];
-  if (csvFile) {
-    document.getElementById('upload-filename').textContent = csvFile.name;
-    document.getElementById('upload-btn').disabled = false;
-  }
-}
-
+// ── CSV PARSING ───────────────────────────────────────────────
 function handleDrop(e) {
   e.preventDefault();
-  document.getElementById('upload-zone').classList.remove('drag');
-  const file = e.dataTransfer.files[0];
-  if (file && file.name.endsWith('.csv')) {
-    csvFile = file;
-    document.getElementById('upload-filename').textContent = file.name;
-    document.getElementById('upload-btn').disabled = false;
-  } else {
-    notify('Please drop a .csv file', true);
-  }
+  document.getElementById('drop-zone').classList.remove('drag');
+  const f = e.dataTransfer.files[0];
+  if (f) parseCSV(f);
+}
+function handleFileInput(inp) { if (inp.files[0]) parseCSV(inp.files[0]); }
+function parseCSV(file) {
+  Papa.parse(file, {
+    header:true, skipEmptyLines:true,
+    complete(res) { processCSV(res.data); }
+  });
 }
 
-async function uploadCSV() {
-  if (!csvFile) return;
-  const sessionId = document.getElementById('upload-session-select').value;
-  if (!sessionId || sessionId === 'new') {
-    notify('Please select an existing session', true);
-    return;
-  }
-  const capital = parseFloat(document.getElementById('upload-capital').value);
-  if (capital > 0) {
-    // Update capital on session first
-    const s = sessions.find(x => x.id === sessionId);
-    if (s) {
-      s.capital = capital;
-      await apiFetch('/sessions', { method:'POST', body:JSON.stringify({
-        ...s, index_name: s.index||s.index_name, scores:{overall:s.scores?.overall||0,...s.scores}
-      })}).catch(()=>{});
+function getCol(row, ...keys) {
+  for (const k of keys) {
+    for (const col in row) {
+      if (col.trim().toLowerCase().replace(/[\\s_\\-]/g,'') === k.toLowerCase().replace(/[\\s_\\-]/g,''))
+        return row[col]?.trim() || '';
     }
   }
+  return '';
+}
 
-  const btn = document.getElementById('upload-btn');
-  btn.innerHTML = '<span class="spinner"></span>Parsing…';
-  btn.disabled = true;
+function isExecuted(row) {
+  const s = getCol(row,'status','orderstatus','order_status','state').toLowerCase();
+  if (!s) return true; // no status column — treat all as executed
+  return s.includes('complet') || s.includes('execut') || s.includes('traded') || s.includes('filled') || s === 'done';
+}
 
-  const formData = new FormData();
-  formData.append('file', csvFile);
+function processCSV(rows) {
+  const exec = rows.filter(r => isExecuted(r));
+  const rej  = rows.filter(r => {
+    const s = getCol(r,'status','orderstatus','order_status','state').toLowerCase();
+    return s.includes('reject') || s.includes('cancel') || s.includes('failed');
+  });
 
-  try {
-    const token = getToken();
-    const res = await fetch(`${API}/upload-csv/${sessionId}`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}` },
-      body: formData
-    });
-    if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
-    const data = await res.json();
+  if (exec.length === 0) { toast('No executed trades found in CSV — check Status column values', 'err'); return; }
 
-    // Refresh sessions
-    sessions = await apiFetch('/sessions');
-    populateSelects();
-
-    // Show result
-    const charges = data.charges_breakdown;
-    document.getElementById('upload-result').style.display = 'block';
-    document.getElementById('upload-result').innerHTML = `
-      <div class="info-box" style="border-color:var(--green)">
-        <b>✅ Parse successful — ${data.message}</b><br>
-        Gross P&L: ₹${data.gross_pnl.toLocaleString('en-IN')} &nbsp;|&nbsp;
-        Net P&L: ₹${data.net_pnl.toLocaleString('en-IN')} &nbsp;|&nbsp;
-        Charges: ₹${data.total_charges.toLocaleString('en-IN')}<br>
-        STT: ₹${charges.stt.toLocaleString('en-IN')} &nbsp;|&nbsp;
-        Exchange: ₹${charges.exchange.toLocaleString('en-IN')} &nbsp;|&nbsp;
-        SEBI: ₹${charges.sebi.toFixed(2)} &nbsp;|&nbsp;
-        Stamp: ₹${charges.stamp.toLocaleString('en-IN')} &nbsp;|&nbsp;
-        GST: ₹${charges.gst.toLocaleString('en-IN')}<br>
-        ${data.carry_positions.length ? `<b style="color:var(--yellow)">⚠ ${data.carry_positions.length} carry position(s): ${data.carry_positions.map(p=>p.symbol).join(', ')}</b>` : ''}
-        ${data.warnings.length ? `<br><span style="color:var(--red)">Warnings: ${data.warnings.join(' | ')}</span>` : ''}
-      </div>
-    `;
-    notify('CSV parsed and saved!');
-  } catch(e) {
-    notify(e.message, true);
-  } finally {
-    btn.textContent = 'Upload & Parse';
-    btn.disabled = false;
+  const agg = {};
+  let totalBV = 0, totalSV = 0;
+  for (const r of exec) {
+    const sym  = getCol(r,'symbolname','symbol name','symbol','tradingsymbol','scripname').trim().toUpperCase();
+    const side = getCol(r,'side','transactiontype','transaction_type','buysell','buy_sell','b/s').toUpperCase();
+    const qty  = parseInt(getCol(r,'qty','quantity','tradedqty','filledqty','filled_quantity','tradeqty'))||0;
+    const price= parseFloat(getCol(r,'tradedprice','traded price','averageprice','average_price','avg_price','tradeprice','price'))||0;
+    if (!sym || qty<=0 || price<=0) continue;
+    const val = qty * price;
+    if (!agg[sym]) agg[sym] = {bq:0,bv:0,sq:0,sv:0,open:false};
+    const isBuy = side.includes('BUY') || side === 'B' || side === 'LONG';
+    const isSell= side.includes('SELL')|| side === 'S' || side === 'SHORT';
+    if (isBuy)  { agg[sym].bq+=qty; agg[sym].bv+=val; totalBV+=val; }
+    else if (isSell) { agg[sym].sq+=qty; agg[sym].sv+=val; totalSV+=val; }
   }
+
+  if (Object.keys(agg).length === 0) { toast('Could not parse any trades — check Symbol, Side, Qty, Price columns', 'err'); return; }
+
+  const carry = {};
+  for (const [sym, d] of Object.entries(agg)) {
+    if (d.bq>0 && d.sq===0) carry[sym] = {side:'BUY', qty:d.bq};
+    if (d.sq>0 && d.bq===0) carry[sym] = {side:'SELL', qty:d.sq};
+  }
+
+  RAW.trades = exec; RAW.agg = agg; RAW.carry = carry; RAW.metrics = null;
+  recompute();
+  toast(`Parsed ${exec.length} executions, ${rej.length} rejections, ${Object.keys(agg).length} symbols`, 'ok');
+  renderView();
 }
 
-// ══════════════════════════════════════
-//  ADD SESSION MODAL
-// ══════════════════════════════════════
-function openAddModal() {
-  if (userRole !== 'admin') { notify('Admin only', true); return; }
-  const last = sessions[sessions.length-1];
-  const next = new Date(last?.id || new Date());
-  next.setDate(next.getDate() + 3);
-  document.getElementById('f-date').value = next.toISOString().split('T')[0];
-  document.getElementById('add-modal').classList.add('open');
-}
-function closeAddModal() { document.getElementById('add-modal').classList.remove('open'); }
+function recompute() {
+  if (!RAW.trades.length) return;
+  const agg = RAW.agg;
+  const vix = parseFloat(document.getElementById('cfg-vix')?.value)||0;
+  const dte = parseInt(document.getElementById('cfg-dte')?.value)||0;
+  const capital = parseInt(document.getElementById('cfg-capital')?.value)||20000000;
+  const brokerage = parseFloat(document.getElementById('cfg-brok')?.value)||0;
+  const peers = (document.getElementById('cfg-peers')?.value||'').split(',').map(x=>parseFloat(x.trim())).filter(x=>!isNaN(x));
+  const character = document.getElementById('cfg-char')?.value||'range';
+  const context = document.getElementById('cfg-ctx')?.value||'normal';
 
-async function saveSession() {
-  const date = document.getElementById('f-date').value;
-  if (!date) { document.getElementById('save-err').textContent='Date required'; return; }
-  const d    = new Date(date);
-  const mos  = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const gross    = parseFloat(document.getElementById('f-gross').value) || 0;
-  const charges  = parseFloat(document.getElementById('f-charges').value) || 0;
-  const capital  = parseFloat(document.getElementById('f-capital').value) || 20000000;
-  const net      = gross - charges;
-  const violations = document.getElementById('f-violations').value.split('\n').filter(x=>x.trim());
-  const strengths  = document.getElementById('f-strengths').value.split('\n').filter(x=>x.trim());
-  const overallScore = parseInt(document.getElementById('f-score').value) || 0;
+  let totalBV=0, totalSV=0, grossPnl=0, cePnl=0, pePnl=0;
+  const positions = {};
+  let openCount = 0;
 
-  const body = {
-    id:         date,
-    date:       `${d.getDate().toString().padStart(2,'0')} ${mos[d.getMonth()]}`,
-    full:       `${d.getDate().toString().padStart(2,'0')}-${mos[d.getMonth()]}-${d.getFullYear()}`,
-    index_name: document.getElementById('f-index').value,
-    dte:        0,
-    vix:        parseFloat(document.getElementById('f-vix').value) || null,
-    capital:    capital,
-    gross_pnl:  gross || null,
-    net_pnl:    net,
-    net_roi:    capital ? +(net/capital*100).toFixed(4) : null,
-    gross_roi:  capital ? +(gross/capital*100).toFixed(4) : null,
-    ce_pnl:     parseFloat(document.getElementById('f-ce').value) || null,
-    pe_pnl:     parseFloat(document.getElementById('f-pe').value) || null,
-    charges:    charges || null,
-    executed:   parseInt(document.getElementById('f-executed').value) || null,
-    rejected:   parseInt(document.getElementById('f-rejected').value) || 0,
-    mt:         parseFloat(document.getElementById('f-mt').value) || null,
-    carry_out:  0,
-    peer_rois:  [],
-    scores:     {overall:overallScore,discipline:0,cap_eff:0,trade_q:0,mkt_align:0,vol_handle:0,peer_cmp:0},
-    violations, strengths
+  for (const [sym, d] of Object.entries(agg)) {
+    const ba = d.bq ? d.bv/d.bq : 0;
+    const sa = d.sq ? d.sv/d.sq : 0;
+    let pnl=0, open=false;
+
+    if (RAW.carry[sym]) {
+      const inp = document.getElementById('carry-'+sym);
+      const tp  = document.getElementById('carrytype-'+sym);
+      if (inp && inp.value) {
+        const ep = parseFloat(inp.value);
+        pnl = RAW.carry[sym].side==='SELL' ? (ep - ba)*d.bq : (sa - ep)*d.sq;
+      } else { open=true; openCount++; pnl=(sa-ba)*Math.min(d.bq,d.sq); }
+      if (tp && tp.value==='open') open=true;
+    } else {
+      const matched = Math.min(d.bq, d.sq);
+      pnl = matched > 0 ? (sa-ba)*matched : 0;
+      open = d.bq !== d.sq;
+      if (open) openCount++;
+    }
+
+    positions[sym] = {ba, sa, bq:d.bq, sq:d.sq, pnl, open};
+    grossPnl += pnl;
+    totalBV += d.bv; totalSV += d.sv;
+    if (sym.endsWith('CE')) cePnl += pnl;
+    else if (sym.endsWith('PE')) pePnl += pnl;
+  }
+
+  const stt      = totalSV * 0.0015;
+  const exchange = (totalBV+totalSV) * 0.00053;
+  const sebi     = ((totalBV+totalSV)/1e7) * 10;
+  const stamp    = totalBV * 0.00003;
+  const gst      = (exchange+sebi) * 0.18;
+  const charges  = stt+exchange+sebi+stamp+gst+brokerage;
+  const netPnl   = grossPnl - charges;
+  const mt       = computeMT(vix, dte, character, context);
+
+  RAW.metrics = {
+    vix, dte, capital, brokerage, peer_rois:peers,
+    gross_pnl:Math.round(grossPnl), net_pnl:Math.round(netPnl),
+    ce_pnl:Math.round(cePnl), pe_pnl:Math.round(pePnl),
+    charges:Math.round(charges),
+    charges_breakdown:{stt,exchange,sebi,stamp,gst,brokerage},
+    executed:RAW.trades.length, rejected:0, mt, positions,
+    carry_out:openCount, index:'Nifty', date_id:getTodayId()
   };
+}
 
-  const saveBtn = document.querySelector('.modal-actions .btn');
-  saveBtn.innerHTML = '<span class="spinner"></span>Saving…';
-  saveBtn.disabled = true;
+function computeMT(vix, dte, ch, ctx) {
+  const vixS = vix<13?2:vix<16?4:vix<20?6:vix<24?7:vix<28?8:9;
+  const dteS = dte>=5?3:dte>=3?5:dte===2?6:dte===1?8:10;
+  const chS  = {range:2,trend:7,vrecovery:8,gaptrend:9}[ch]||3;
+  const ctxS = {normal:3,postevent:7,crash:7,macro:8}[ctx]||3;
+  return +(vixS*.20+dteS*.25+chS*.30+ctxS*.25).toFixed(2);
+}
 
+function skipCarry() {
+  Object.keys(RAW.carry).forEach(sym => {
+    const tp = document.getElementById('carrytype-'+sym);
+    if (tp) tp.value = 'open';
+  });
+  recompute();
+}
+
+function handleChartImg(inp) {
+  const f = inp.files[0]; if (!f) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    RAW.chartFile = e.target.result;
+    const prev = document.getElementById('chart-preview');
+    if (prev) prev.innerHTML = `<img src="${e.target.result}" alt="chart">`;
+    toast('Chart image attached', 'ok');
+  };
+  reader.readAsDataURL(f);
+}
+
+async function saveFromUpload() {
+  if (USER_ROLE !== 'admin') { toast('Admin only', 'err'); return; }
+  const m = RAW.metrics; if (!m) { toast('No data to save', 'err'); return; }
+  const dateId = document.getElementById('save-date')?.value.trim() || getTodayId();
+  const idx    = document.getElementById('save-index')?.value || 'Nifty';
+  const notes  = document.getElementById('save-notes')?.value.trim() || '';
+  const d = new Date(dateId);
+  const mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const sess = {
+    id:dateId,
+    date:`${mo[d.getMonth()]} ${d.getDate()}`,
+    full:`${String(d.getDate()).padStart(2,'0')}-${mo[d.getMonth()]}-${d.getFullYear()}`,
+    index:idx, dte:m.dte, vix:m.vix, capital:m.capital,
+    net_pnl:m.net_pnl, gross_pnl:m.gross_pnl,
+    net_roi:+(m.net_pnl/m.capital*100).toFixed(6),
+    gross_roi:+(m.gross_pnl/m.capital*100).toFixed(6),
+    pe_pnl:m.pe_pnl, ce_pnl:m.ce_pnl,
+    charges:m.charges, charges_breakdown:m.charges_breakdown,
+    executed:m.executed, rejected:m.rejected, mt:m.mt,
+    peer_rois:m.peer_rois, carry_out:m.carry_out, notes,
+    scores:{overall:0,discipline:0,cap_eff:0,trade_q:0,mkt_align:0,vol_handle:0,peer_cmp:0},
+    violations:[], strengths:[], positions:Object.entries(m.positions).map(([sym,p])=>({
+      sym, strike:parseStrike(sym),
+      side:p.sq>p.bq?'SHORT':'LONG',
+      entry:+(p.sq>p.bq?p.sa:p.ba).toFixed(2),
+      exit:+(p.sq>p.bq?p.ba:p.sa).toFixed(2),
+      qty:Math.max(p.sq,p.bq), pnl:Math.round(p.pnl), open:p.open
+    })),
+    time_pnl:{}, chart_img:RAW.chartFile||null
+  };
   try {
-    await apiFetch('/sessions', { method:'POST', body:JSON.stringify(body) });
-    sessions = await apiFetch('/sessions');
-    populateSelects();
-    renderOverview();
-    closeAddModal();
-    notify('Session saved to server!');
-  } catch(e) {
-    document.getElementById('save-err').textContent = e.message;
-  } finally {
-    saveBtn.textContent = 'Save to Server';
-    saveBtn.disabled = false;
+    await saveSession(sess);
+    // Upload chart if attached
+    if (RAW.chartFile && RAW.chartFile.startsWith('data:image')) {
+      const res = await fetch(RAW.chartFile);
+      const blob = await res.blob();
+      const fd = new FormData();
+      fd.append('file', blob, 'chart.png');
+      const token = getToken();
+      await fetch(`/upload-chart/${dateId}`, { method:'POST', headers:{'Authorization':`Bearer ${token}`}, body:fd });
+    }
+    await loadSessions();
+    CUR = SESSIONS.find(s => s.id === dateId) || SESSIONS[0];
+    toast(`Session ${sess.full} saved`, 'ok');
+    resetUpload();
+    setView('overview');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+function parseStrike(sym) {
+  const m = sym.match(/(\\d{4,6})(CE|PE)$/i);
+  return m ? `${m[1]}${m[2].toUpperCase()}` : sym;
+}
+
+function resetUpload() {
+  RAW = {trades:[],agg:{},carry:{},metrics:null,chartFile:null};
+  renderView();
+}
+
+function loadSampleCSV() {
+  const rows = [
+    {Symbol:'NIFTY2641023300CE',Side:'SELL',Qty:'375',TradedPrice:'98',Status:'Executed'},
+    {Symbol:'NIFTY2641023300CE',Side:'BUY', Qty:'375',TradedPrice:'62',Status:'Executed'},
+    {Symbol:'NIFTY2641022700PE',Side:'SELL',Qty:'750',TradedPrice:'92',Status:'Executed'},
+    {Symbol:'NIFTY2641022700PE',Side:'BUY', Qty:'750',TradedPrice:'8', Status:'Executed'},
+    {Symbol:'NIFTY2641023100CE',Side:'SELL',Qty:'375',TradedPrice:'155',Status:'Executed'},
+    {Symbol:'NIFTY2641023100CE',Side:'BUY', Qty:'375',TradedPrice:'175',Status:'Executed'},
+  ];
+  processCSV(rows);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  OVERVIEW VIEW
+// ══════════════════════════════════════════════════════════════
+function vOverview() {
+  if (!CUR) return noSession();
+  const s = CUR;
+  const cr = s.gross_pnl>0 ? (s.charges/s.gross_pnl*100).toFixed(1) : 'N/A';
+  const ceA=Math.abs(s.ce_pnl||0), peA=Math.abs(s.pe_pnl||0), tot=ceA+peA||1;
+  return `
+    <div class="grid4">
+      <div class="mc"><div class="mc-lbl">Gross P&L</div>
+        <div class="mc-val ${(s.gross_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.gross_pnl||0)}</div>
+        <div class="mc-sub">${(s.gross_roi||0).toFixed(4)}% of ₹${fmtCr(s.capital)}</div></div>
+      <div class="mc"><div class="mc-lbl">Net P&L</div>
+        <div class="mc-val ${(s.net_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.net_pnl||0)}</div>
+        <div class="mc-sub">After ₹${(s.charges||0).toLocaleString('en-IN')} charges (${cr}%)</div></div>
+      <div class="mc"><div class="mc-lbl">Score</div>
+        <div class="mc-val" style="color:${scCol(s.scores.overall)}">${s.scores.overall}/100</div>
+        <div class="mc-sub" style="color:${scCol(s.scores.overall)}">${scLbl(s.scores.overall)}</div></div>
+      <div class="mc"><div class="mc-lbl">Market Toughness</div>
+        <div class="mc-val" style="color:${(s.mt||0)>=7?'var(--rd)':(s.mt||0)>=5?'var(--am)':'var(--gr)'}">${s.mt||'—'}/10</div>
+        <div class="mc-sub">VIX ${s.vix||'—'} · DTE ${s.dte}</div></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><div class="card-title">Intraday P&L Curve</div><div class="chart-wrap"><canvas id="eq-chart"></canvas></div></div>
+      <div class="card">
+        <div class="card-title">CE vs PE Split</div>
+        <div class="split-bar" style="height:10px;margin:12px 0 6px">
+          <div style="width:${ceA/tot*100}%;background:var(--rd);border-radius:4px 0 0 4px"></div>
+          <div style="width:${peA/tot*100}%;background:var(--gr);border-radius:0 4px 4px 0"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:14px">
+          <span style="color:var(--rd)">CE: ${fmtInr(s.ce_pnl||0)}</span>
+          <span style="color:var(--gr)">PE: ${fmtInr(s.pe_pnl||0)}</span>
+        </div>
+        <div class="chart-wrap-sm"><canvas id="cepe-chart"></canvas></div>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title">Strengths</div>
+        ${s.strengths.length ? s.strengths.map(t=>`<div class="alert-row"><div class="adot" style="background:var(--gr)"></div><div style="font-size:12px">${t}</div></div>`).join('') : '<div style="font-size:11px;color:var(--tx3)">None recorded</div>'}
+      </div>
+      <div class="card">
+        <div class="card-title">Violations <span class="card-badge">${s.violations.length} flagged</span></div>
+        ${s.violations.length ? s.violations.map(v=>`<div class="alert-row"><div class="adot" style="background:var(--am)"></div><div style="font-size:12px;color:var(--am)">${v}</div></div>`).join('') : '<div style="font-size:11px;color:var(--gr)">No violations recorded ✓</div>'}
+      </div>
+    </div>
+    ${s.peer_rois&&s.peer_rois.length ? `<div class="card"><div class="card-title">Peer Comparison</div>${renderPeerBars(s)}</div>` : ''}
+    ${s.chart_img ? `<div class="card"><div class="card-title">Session Chart</div><div class="chart-img-wrap"><img src="${s.chart_img}" alt="session chart" style="max-height:280px"></div></div>` : ''}
+    ${s.ai_commentary ? `<div class="card"><div class="card-title">AI Commentary</div><div style="font-size:13px;line-height:1.8;color:var(--tx2)">${s.ai_commentary.replace(/\\n/g,'<br>')}</div></div>` : ''}
+    <div style="text-align:right;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-sm admin-only" onclick="openEditModal('${s.id}')">✏ Edit Session</button>
+      <button class="btn btn-sm btn-pr admin-only" onclick="generateAI('${s.id}')">✦ AI Commentary</button>
+    </div>`;
+}
+
+function renderPeerBars(s) {
+  const myRoi = s.net_roi || 0;
+  const all = [{lbl:'You',roi:myRoi}, ...(s.peer_rois||[]).map((r,i)=>({lbl:`Peer ${i+1}`,roi:r}))];
+  const maxAbs = Math.max(...all.map(x=>Math.abs(x.roi)),0.01);
+  return all.map(p => `
+    <div class="peer-row">
+      <div style="width:60px;font-size:11px;color:${p.lbl==='You'?'var(--bl)':'var(--tx2)'};font-weight:${p.lbl==='You'?600:400}">${p.lbl}</div>
+      <div class="peer-bar-wrap"><div class="peer-bar-fill" style="width:${Math.abs(p.roi)/maxAbs*100}%;background:${p.roi>=0?'var(--gr)':'var(--rd)'}"></div></div>
+      <div class="peer-val ${p.roi>=0?'pos':'neg'}">${p.roi>0?'+':''}${p.roi.toFixed(4)}%</div>
+    </div>`).join('');
+}
+
+// ══════════════════════════════════════════════════════════════
+//  STRIKE P&L VIEW
+// ══════════════════════════════════════════════════════════════
+function vStrikes() {
+  if (!CUR) return noSession();
+  const s = CUR;
+  const pos = s.positions || [];
+  return `
+    <div class="card">
+      <div class="card-title">Strike-wise P&L — ${s.full} <span class="card-badge">${pos.length} strikes</span></div>
+      ${pos.length ? `
+      <table class="tbl">
+        <thead><tr><th>Symbol</th><th>Type</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Status</th></tr></thead>
+        <tbody>
+          ${pos.map(p=>`<tr>
+            <td class="fm" style="font-size:11px">${p.sym||p.strike||'—'}</td>
+            <td><span class="badge ${(p.sym||'').endsWith('CE')?'b-rd':'b-gr'}">${(p.sym||'').endsWith('CE')?'CE':'PE'}</span></td>
+            <td><span class="badge ${p.side==='SHORT'?'b-rd':'b-gr'}">${p.side||'—'}</span></td>
+            <td class="fm">₹${p.entry||0}</td>
+            <td class="fm">₹${p.exit||0}</td>
+            <td class="fm">${p.qty||0}</td>
+            <td class="fm ${(p.pnl||0)>=0?'pos':'neg'}">${fmtInr(p.pnl||0)}</td>
+            <td><span class="badge ${p.open?'b-am':'b-bl'}">${p.open?'⚠ OPEN':'CLOSED'}</span></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <div style="display:flex;gap:24px;margin-top:12px;padding-top:10px;border-top:1px solid var(--bd)">
+        <span style="font-size:12px;color:var(--tx2)">CE: <span class="fm ${(s.ce_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.ce_pnl||0)}</span></span>
+        <span style="font-size:12px;color:var(--tx2)">PE: <span class="fm ${(s.pe_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.pe_pnl||0)}</span></span>
+        <span style="font-size:12px;color:var(--tx2)">Gross: <span class="fm ${(s.gross_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.gross_pnl||0)}</span></span>
+      </div>` : '<div style="color:var(--tx3);font-size:12px">No strike data. Upload a CSV to parse individual strikes.</div>'}
+    </div>
+    ${s.time_pnl&&Object.keys(s.time_pnl).length ? `
+    <div class="card">
+      <div class="card-title">Time-of-Day P&L</div>
+      ${Object.entries(s.time_pnl).map(([t,v])=>{
+        const maxV=Math.max(...Object.values(s.time_pnl).map(Math.abs),1);
+        const pct=Math.abs(v)/maxV*100;
+        const bg=v>0?`rgba(63,185,80,${.1+pct*.007})`:`rgba(248,81,73,${.1+pct*.007})`;
+        return `<div class="hm-row"><div class="hm-lbl">${t}</div><div class="hm-bar" style="background:${bg}"><span class="hm-val ${v>=0?'pos':'neg'}">${fmtInr(v)}</span></div></div>`;
+      }).join('')}
+    </div>` : ''}`;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  SCORING VIEW
+// ══════════════════════════════════════════════════════════════
+function vScoring() {
+  if (!CUR) return noSession();
+  const s = CUR, sc = s.scores;
+  const dims = [
+    ['Discipline',sc.discipline,'30%'],['Capital Efficiency',sc.cap_eff,'25%'],
+    ['Trade Quality',sc.trade_q,'20%'],['Market Alignment',sc.mkt_align,'10%'],
+    ['Volatility Handling',sc.vol_handle,'10%'],['Peer Comparison',sc.peer_cmp,'5%'],
+  ];
+  return `
+    <div class="card">
+      <div class="card-title">Session Scorecard — ${s.full}</div>
+      <div class="ring-section">
+        <div class="ring-wrap"><canvas id="ring-chart" width="110" height="110"></canvas>
+          <div class="ring-center"><div class="ring-val" style="color:${scCol(sc.overall)}">${sc.overall}</div><div class="ring-lbl">${scLbl(sc.overall)}</div></div>
+        </div>
+        <div class="dims">
+          ${dims.map(([lbl,val,wt])=>`<div class="dim">
+            <div class="dim-row"><span>${lbl} <span style="color:var(--tx3);font-size:9px">${wt}</span></span><span style="color:${scCol(val)};font-weight:600">${val}</span></div>
+            <div class="pbar"><div class="pfill" style="width:${val}%;background:${scCol(val)}"></div></div>
+          </div>`).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title">Violations <span class="card-badge">${s.violations.length}</span></div>
+        ${s.violations.length?s.violations.map(v=>`<div class="alert-row"><div class="adot" style="background:var(--am)"></div><div style="font-size:12px;color:var(--am)">${v}</div></div>`).join(''):'<div style="color:var(--gr);font-size:11px">No violations ✓</div>'}
+      </div>
+      <div class="card">
+        <div class="card-title">Strengths <span class="card-badge">${s.strengths.length}</span></div>
+        ${s.strengths.length?s.strengths.map(t=>`<div class="alert-row"><div class="adot" style="background:var(--gr)"></div><div style="font-size:12px">${t}</div></div>`).join(''):'<div style="color:var(--tx3);font-size:11px">None recorded</div>'}
+      </div>
+    </div>
+    <div class="card" style="text-align:right">
+      <button class="btn btn-sm btn-pr admin-only" onclick="openEditModal('${s.id}')">✏ Edit Scores / Violations / Strengths</button>
+    </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  CHARGES VIEW
+// ══════════════════════════════════════════════════════════════
+function vCharges() {
+  if (!CUR) return noSession();
+  const s = CUR, cb = s.charges_breakdown || {};
+  const cr = s.gross_pnl>0 ? (s.charges/s.gross_pnl*100).toFixed(2) : 'N/A';
+  const items = [
+    ['STT (0.15% on sell side)', cb.stt||0],
+    ['NSE Exchange Fee (0.053% both)', cb.exchange||0],
+    ['SEBI Fee (₹10 per Crore)', cb.sebi||0],
+    ['Stamp Duty (0.003% on buy)', cb.stamp||0],
+    ['GST (18% on Exchange+SEBI)', cb.gst||0],
+    ['Brokerage', cb.brokerage||0],
+  ];
+  return `
+    <div class="card">
+      <div class="card-title">Charges Breakdown — ${s.full} <span class="card-badge">post-Budget 2024</span></div>
+      ${items.map(([l,v])=>`<div class="chg-row"><div class="chg-lbl">${l}</div><div class="chg-val">${fmtInr(Math.round(v))}</div></div>`).join('')}
+      <div class="chg-row" style="border-top:1px solid var(--bd2);margin-top:4px;padding-top:10px">
+        <div class="chg-lbl" style="font-weight:600;color:var(--tx)">Total Charges</div>
+        <div class="chg-val" style="color:var(--rd)">${fmtInr(s.charges||0)}</div>
+      </div>
+    </div>
+    <div class="grid3">
+      <div class="mc"><div class="mc-lbl">Gross P&L</div><div class="mc-val ${(s.gross_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.gross_pnl||0)}</div></div>
+      <div class="mc"><div class="mc-lbl">Total Charges</div><div class="mc-val neg">−${fmtInr(s.charges||0)}</div></div>
+      <div class="mc"><div class="mc-lbl">Net P&L</div><div class="mc-val ${(s.net_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.net_pnl||0)}</div>
+        <div class="mc-sub">Charge ratio: ${cr}% of gross</div></div>
+    </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  JOURNAL VIEW
+// ══════════════════════════════════════════════════════════════
+function vJournal() {
+  if (!CUR) return noSession();
+  const s = CUR;
+  return `
+    <div class="card">
+      <div class="card-title">Trade Journal — ${s.full}
+        <span class="card-badge">${s.index} · VIX ${s.vix||'—'}</span>
+      </div>
+      ${s.chart_img ? `
+        <div class="card-title" style="margin-top:10px">Session Chart</div>
+        <div class="chart-img-wrap" style="margin-bottom:14px"><img src="${s.chart_img}" alt="chart"></div>
+      ` : ''}
+      <div class="admin-only">
+        <div style="margin-bottom:8px">
+          <button class="btn btn-sm" onclick="document.getElementById('jrn-chart-inp').click()">📷 Upload/Replace Chart</button>
+          <input type="file" id="jrn-chart-inp" accept="image/*" style="display:none" onchange="uploadChartFromJournal(this)">
+          ${s.chart_img ? `<button class="btn btn-sm btn-rd" style="margin-left:8px" onclick="deleteChartFromJournal()">Remove Chart</button>` : ''}
+        </div>
+      </div>
+      <div class="card-title" style="margin-top:14px">Notes</div>
+      <div class="admin-only">
+        <textarea id="jrn-text" rows="10" placeholder="Pre-market plan, trade rationale, post-session observations, lessons learned…">${s.journal||''}</textarea>
+        <div class="btn-row" style="margin-top:10px">
+          <button class="btn btn-gr btn-sm" onclick="saveJournal()">💾 Save Journal</button>
+        </div>
+      </div>
+      ${USER_ROLE !== 'admin' ? `<div style="white-space:pre-wrap;font-size:13px;line-height:1.8;color:var(--tx2);font-family:var(--fm)">${s.journal||'<span style="color:var(--tx3)">No journal entry</span>'}</div>` : ''}
+    </div>`;
+}
+
+function bindJournalEvents() {}
+
+async function saveJournal() {
+  if (!CUR || USER_ROLE !== 'admin') return;
+  const journal = document.getElementById('jrn-text')?.value || '';
+  try {
+    await saveSession({...CUR, journal});
+    await loadSessions();
+    CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
+    CUR.journal = journal;
+    toast('Journal saved', 'ok');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+async function uploadChartFromJournal(inp) {
+  if (!CUR || !inp.files[0]) return;
+  const fd = new FormData();
+  fd.append('file', inp.files[0]);
+  const token = getToken();
+  try {
+    const res = await fetch(`/upload-chart/${CUR.id}`, { method:'POST', headers:{'Authorization':`Bearer ${token}`}, body:fd });
+    if (!res.ok) { const e=await res.json(); throw new Error(e.detail); }
+    await loadSessions();
+    CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
+    renderView();
+    toast('Chart uploaded', 'ok');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+async function deleteChartFromJournal() {
+  if (!CUR) return;
+  try {
+    await apiFetch(`/upload-chart/${CUR.id}`, { method:'DELETE' });
+    await loadSessions();
+    CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
+    renderView();
+    toast('Chart removed', 'ok');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  SESSIONS VIEW
+// ══════════════════════════════════════════════════════════════
+function vSessions() {
+  if (!SESSIONS.length) return `<div class="empty"><span class="empty-ico">📂</span><div class="empty-txt">No sessions yet</div><div class="empty-sub">Upload a CSV or use "+ Add Session"</div></div>`;
+  return `
+    <div class="card" style="padding:0">
+      <div style="padding:12px 14px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between">
+        <div class="card-title" style="margin:0">All Sessions <span class="card-badge">${SESSIONS.length}</span></div>
+        <div class="btn-row">
+          <button class="btn btn-sm btn-pr admin-only" onclick="openAddModal()">+ Add Session</button>
+          <button class="btn btn-sm" onclick="exportAllJSON()">⬇ Export All</button>
+        </div>
+      </div>
+      ${SESSIONS.map(s=>`
+        <div class="sess-item ${CUR&&CUR.id===s.id?'sel':''}" onclick="selectSession('${s.id}')">
+          <div class="sess-left">
+            <div class="sess-date">${s.full}</div>
+            <div class="sess-idx">${s.index||s.index_name} · DTE=${s.dte} · VIX ${s.vix||'—'} · MT ${s.mt||'—'}</div>
+          </div>
+          <div style="flex:1">
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              ${s.violations.length?`<span class="badge b-am">${s.violations.length} violations</span>`:'<span class="badge b-gr">clean</span>'}
+              ${s.carry_out?`<span class="badge b-am">${s.carry_out} carry</span>`:''}
+              <span class="badge b-bl">Score ${s.scores.overall}</span>
+              ${s.chart_img?'<span class="badge b-pr">📷 chart</span>':''}
+              ${s.journal?'<span class="badge b-pr">📝 journal</span>':''}
+            </div>
+          </div>
+          <div class="sess-right">
+            <div class="sess-pnl ${(s.net_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.net_pnl||0)}</div>
+            <div class="sess-roi ${(s.net_roi||0)>=0?'pos':'neg'}">${(s.net_roi||0)>0?'+':''}${(s.net_roi||0).toFixed(4)}%</div>
+          </div>
+          <div style="display:flex;gap:6px;margin-left:8px">
+            <button class="btn btn-sm admin-only" onclick="event.stopPropagation();openEditModal('${s.id}')" title="Edit">✏</button>
+            <button class="btn btn-sm btn-rd admin-only" onclick="event.stopPropagation();deleteSession('${s.id}')" title="Delete">✕</button>
+          </div>
+        </div>`).join('')}
+    </div>`;
+}
+
+function selectSession(id) {
+  CUR = SESSIONS.find(s => s.id === id);
+  setView('overview');
+}
+
+// ══════════════════════════════════════════════════════════════
+//  TRENDS VIEW
+// ══════════════════════════════════════════════════════════════
+function vTrends() {
+  if (SESSIONS.length < 2) return `<div class="empty"><span class="empty-ico">📈</span><div class="empty-txt">Need at least 2 sessions</div></div>`;
+  const sorted = [...SESSIONS].sort((a,b)=>a.id.localeCompare(b.id));
+  return `
+    <div class="grid2">
+      <div class="card"><div class="card-title">Net ROI per Session</div><div class="chart-wrap"><canvas id="roi-chart"></canvas></div></div>
+      <div class="card"><div class="card-title">Score Trend</div><div class="chart-wrap"><canvas id="score-chart"></canvas></div></div>
+    </div>
+    <div class="card"><div class="card-title">VIX vs Net ROI</div><div class="chart-wrap"><canvas id="vix-chart"></canvas></div></div>
+    <div class="card"><div class="card-title">CE vs PE Comparison</div><div class="chart-wrap"><canvas id="cepe2-chart"></canvas></div></div>
+    <div class="card"><div class="card-title">Summary Statistics</div><div class="grid4">${trendStats(sorted)}</div></div>`;
+}
+
+function trendStats(ss) {
+  const nets = ss.map(s=>s.net_roi||0);
+  const wins = nets.filter(r=>r>0);
+  const totalNet = ss.reduce((a,s)=>a+(s.net_pnl||0),0);
+  const avgScore = Math.round(ss.reduce((a,s)=>a+s.scores.overall,0)/ss.length);
+  return [
+    ['Total Sessions',ss.length,''],
+    ['Win Rate',`${Math.round(wins.length/nets.length*100)}%`,wins.length+' winning'],
+    ['Total Net P&L',fmtInr(totalNet),totalNet>=0?'pos':'neg'],
+    ['Avg Score',`${avgScore}/100`,avgScore>=65?'pos':avgScore>=45?'neu':'neg'],
+  ].map(([l,v,cls])=>`<div class="mc"><div class="mc-lbl">${l}</div><div class="mc-val ${cls}">${v}</div></div>`).join('');
+}
+
+// ══════════════════════════════════════════════════════════════
+//  RULES VIEW
+// ══════════════════════════════════════════════════════════════
+function vRules() {
+  const rules = [
+    [1,"Short CE delta ≤ 0.20 at entry (~2%+ OTM)",true],
+    [2,"Margin utilisation ≤ 80% of deployed capital",true],
+    [3,"No re-entry into CE that went ITM on DTE=1",true],
+    [4,"No new secondary-index positions within 2 hrs of margin rejection",true],
+    [5,"No averaging into losing shorts",true],
+    [6,"Far-OTM wings mandatory when premium collected > 1% of capital",false],
+  ];
+  return `
+    <div class="card">
+      <div class="card-title">Default Trading Rules <span class="card-badge">DTE=1, VIX &gt; 20</span></div>
+      <table class="tbl">
+        <thead><tr><th>#</th><th>Rule</th><th>Status</th></tr></thead>
+        <tbody>
+          ${rules.map(([n,r,a])=>`<tr><td class="fm" style="color:var(--tx3)">${n}</td><td>${r}</td><td><span class="badge ${a?'b-gr':'b-am'}">${a?'ACTIVE':'OPTIONAL'}</span></td></tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  ADD / EDIT MODAL
+// ══════════════════════════════════════════════════════════════
+function openAddModal() {
+  if (USER_ROLE !== 'admin') { toast('Admin only','err'); return; }
+  document.getElementById('modal-title').innerHTML = 'Add Session <button class="modal-close" onclick="closeModal()">✕</button>';
+  document.getElementById('modal-body').innerHTML = modalForm(null);
+  document.getElementById('modal-bg').style.display = 'flex';
+}
+function openEditModal(id) {
+  if (USER_ROLE !== 'admin') { toast('Admin only','err'); return; }
+  const s = SESSIONS.find(x=>x.id===id);
+  document.getElementById('modal-title').innerHTML = `Edit — ${s?s.full:'Session'} <button class="modal-close" onclick="closeModal()">✕</button>`;
+  document.getElementById('modal-body').innerHTML = modalForm(s);
+  document.getElementById('modal-bg').style.display = 'flex';
+}
+function closeModal() { document.getElementById('modal-bg').style.display='none'; }
+
+function modalForm(s) {
+  return `
+    <div class="tab-row" id="modal-tabs">
+      <div class="tab active" onclick="switchModalTab('json',this)">Paste JSON</div>
+      <div class="tab" onclick="switchModalTab('form',this)">Manual Form</div>
+    </div>
+    <div id="modal-json-tab">
+      <div class="form-row" style="margin-bottom:10px">
+        <label>Paste Session Ledger JSON from evaluator skill</label>
+        <textarea id="json-input" rows="16" placeholder='Paste JSON here...'>${s?JSON.stringify(s,null,2):''}</textarea>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-gr" onclick="saveFromJSON()">💾 Save</button>
+        <button class="btn btn-sm" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-sm" onclick="validateJSON()">✓ Validate</button>
+        ${s?`<button class="btn btn-sm btn-rd" style="margin-left:auto" onclick="deleteSession('${s.id}');closeModal()">🗑 Delete</button>`:''}
+      </div>
+    </div>
+    <div id="modal-form-tab" style="display:none">
+      ${manualFormFields(s)}
+      <div class="btn-row" style="margin-top:14px">
+        <button class="btn btn-gr" onclick="saveFromForm()">💾 Save</button>
+        <button class="btn btn-sm" onclick="closeModal()">Cancel</button>
+      </div>
+    </div>`;
+}
+
+function switchModalTab(tab, el) {
+  document.querySelectorAll('#modal-tabs .tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('modal-json-tab').style.display = tab==='json' ? '' : 'none';
+  document.getElementById('modal-form-tab').style.display = tab==='form' ? '' : 'none';
+}
+
+function manualFormFields(s) {
+  const v=s||{}, sc=v.scores||{};
+  return `
+    <div class="form-grid" style="grid-template-columns:1fr 1fr 1fr;margin-bottom:10px">
+      <div class="form-row"><label>Date (YYYY-MM-DD)</label><input type="text" id="mf-id" value="${v.id||getTodayId()}"></div>
+      <div class="form-row"><label>Index</label>
+        <select id="mf-index">${['Nifty','BankNifty','Sensex','FinNifty','Nifty+Sensex','Nifty+BankNifty'].map(i=>`<option${(v.index||'Nifty')===i?' selected':''}>${i}</option>`).join('')}</select></div>
+      <div class="form-row"><label>DTE</label><input type="number" id="mf-dte" value="${v.dte||0}" min="0" max="10"></div>
+      <div class="form-row"><label>India VIX</label><input type="number" id="mf-vix" value="${v.vix||0}" step="0.1"></div>
+      <div class="form-row"><label>Capital ₹</label><input type="number" id="mf-capital" value="${v.capital||20000000}"></div>
+      <div class="form-row"><label>MT Score</label><input type="number" id="mf-mt" value="${v.mt||0}" step="0.01"></div>
+      <div class="form-row"><label>Gross P&L ₹</label><input type="number" id="mf-gross" value="${v.gross_pnl||0}"></div>
+      <div class="form-row"><label>Net P&L ₹</label><input type="number" id="mf-net" value="${v.net_pnl||0}"></div>
+      <div class="form-row"><label>Charges ₹</label><input type="number" id="mf-charges" value="${v.charges||0}"></div>
+      <div class="form-row"><label>CE P&L ₹</label><input type="number" id="mf-ce" value="${v.ce_pnl||0}"></div>
+      <div class="form-row"><label>PE P&L ₹</label><input type="number" id="mf-pe" value="${v.pe_pnl||0}"></div>
+      <div class="form-row"><label>Executed orders</label><input type="number" id="mf-exec" value="${v.executed||0}"></div>
+      <div class="form-row"><label>Rejected orders</label><input type="number" id="mf-rej" value="${v.rejected||0}"></div>
+      <div class="form-row"><label>Carry out</label><input type="number" id="mf-carry" value="${v.carry_out||0}"></div>
+      <div class="form-row"><label>Peer ROIs (comma %)</label><input type="text" id="mf-peers" value="${(v.peer_rois||[]).join(',')}"></div>
+    </div>
+    <div style="font-size:11px;color:var(--tx2);margin-bottom:6px;font-weight:600">SCORES (0–100)</div>
+    <div class="form-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:10px">
+      ${[['Overall','mf-sov',sc.overall||0],['Discipline','mf-sd',sc.discipline||0],['Cap Eff','mf-sce',sc.cap_eff||0],['Trade Q','mf-stq',sc.trade_q||0],['Mkt Align','mf-sma',sc.mkt_align||0],['Vol Handle','mf-svh',sc.vol_handle||0],['Peer Cmp','mf-spc',sc.peer_cmp||0]].map(([l,id,val])=>`<div class="form-row"><label>${l}</label><input type="number" id="${id}" value="${val}" min="0" max="100"></div>`).join('')}
+    </div>
+    <div class="form-grid" style="grid-template-columns:1fr 1fr;margin-bottom:10px">
+      <div class="form-row"><label>Violations (one per line)</label><textarea id="mf-violations" rows="4">${(v.violations||[]).join('\\n')}</textarea></div>
+      <div class="form-row"><label>Strengths (one per line)</label><textarea id="mf-strengths" rows="4">${(v.strengths||[]).join('\\n')}</textarea></div>
+    </div>`;
+}
+
+async function saveFromJSON() {
+  const raw = document.getElementById('json-input').value.trim();
+  if (!raw) { toast('Nothing to save','err'); return; }
+  try {
+    const sess = JSON.parse(raw);
+    if (!sess.id) throw new Error('Missing id field');
+    if (!sess.net_roi) sess.net_roi = +(sess.net_pnl/sess.capital*100).toFixed(6);
+    if (!sess.gross_roi) sess.gross_roi = +(sess.gross_pnl/sess.capital*100).toFixed(6);
+    if (!sess.date||!sess.full) {
+      const d=new Date(sess.id);
+      const mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      sess.date=`${mo[d.getMonth()]} ${d.getDate()}`;
+      sess.full=`${String(d.getDate()).padStart(2,'0')}-${mo[d.getMonth()]}-${d.getFullYear()}`;
+    }
+    await saveSession(sess);
+    await loadSessions();
+    CUR = SESSIONS.find(s=>s.id===sess.id) || SESSIONS[0];
+    closeModal();
+    setView('overview');
+    toast(`Session ${sess.full} saved`,'ok');
+  } catch(e) { toast('Error: '+e.message,'err'); }
+}
+
+function validateJSON() {
+  try { JSON.parse(document.getElementById('json-input').value.trim()); toast('JSON is valid ✓','ok'); }
+  catch(e) { toast('Invalid JSON: '+e.message,'err'); }
+}
+
+async function saveFromForm() {
+  const id = document.getElementById('mf-id').value.trim();
+  if (!id) { toast('Date is required','err'); return; }
+  const d = new Date(id);
+  const mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const grossPnl = parseInt(document.getElementById('mf-gross').value)||0;
+  const netPnl   = parseInt(document.getElementById('mf-net').value)||0;
+  const capital  = parseInt(document.getElementById('mf-capital').value)||20000000;
+  const peers = (document.getElementById('mf-peers').value||'').split(',').map(x=>parseFloat(x.trim())).filter(x=>!isNaN(x));
+  const sess = {
+    id, date:`${mo[d.getMonth()]} ${d.getDate()}`,
+    full:`${String(d.getDate()).padStart(2,'0')}-${mo[d.getMonth()]}-${d.getFullYear()}`,
+    index:document.getElementById('mf-index').value,
+    dte:parseInt(document.getElementById('mf-dte').value)||0,
+    vix:parseFloat(document.getElementById('mf-vix').value)||0,
+    capital, gross_pnl:grossPnl, net_pnl:netPnl,
+    gross_roi:+(grossPnl/capital*100).toFixed(6), net_roi:+(netPnl/capital*100).toFixed(6),
+    ce_pnl:parseInt(document.getElementById('mf-ce').value)||0,
+    pe_pnl:parseInt(document.getElementById('mf-pe').value)||0,
+    charges:parseInt(document.getElementById('mf-charges').value)||0,
+    executed:parseInt(document.getElementById('mf-exec').value)||0,
+    rejected:parseInt(document.getElementById('mf-rej').value)||0,
+    mt:parseFloat(document.getElementById('mf-mt').value)||0,
+    peer_rois:peers,
+    scores:{overall:parseInt(document.getElementById('mf-sov').value)||0,discipline:parseInt(document.getElementById('mf-sd').value)||0,cap_eff:parseInt(document.getElementById('mf-sce').value)||0,trade_q:parseInt(document.getElementById('mf-stq').value)||0,mkt_align:parseInt(document.getElementById('mf-sma').value)||0,vol_handle:parseInt(document.getElementById('mf-svh').value)||0,peer_cmp:parseInt(document.getElementById('mf-spc').value)||0},
+    violations:(document.getElementById('mf-violations').value||'').split('\\n').map(x=>x.trim()).filter(Boolean),
+    strengths:(document.getElementById('mf-strengths').value||'').split('\\n').map(x=>x.trim()).filter(Boolean),
+    carry_out:parseInt(document.getElementById('mf-carry').value)||0,
+    positions:[],time_pnl:{}
+  };
+  try {
+    await saveSession(sess);
+    await loadSessions();
+    CUR = SESSIONS.find(s=>s.id===id) || SESSIONS[0];
+    closeModal();
+    setView('overview');
+    toast(`Session ${sess.full} saved`,'ok');
+  } catch(e) { toast(e.message,'err'); }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  AI COMMENTARY
+// ══════════════════════════════════════════════════════════════
+async function generateAI(id) {
+  if (USER_ROLE !== 'admin') { toast('Admin only','err'); return; }
+  toast('Generating AI commentary…','');
+  try {
+    await apiFetch(`/ai-commentary/${id}`, { method:'POST' });
+    await loadSessions();
+    CUR = SESSIONS.find(s=>s.id===id) || CUR;
+    renderView();
+    toast('AI commentary generated','ok');
+  } catch(e) { toast(e.message,'err'); }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  CHARTS
+// ══════════════════════════════════════════════════════════════
+function buildOverviewCharts() {
+  const s = CUR; if (!s) return;
+  const eq = document.getElementById('eq-chart');
+  if (eq) {
+    const hasTP = s.time_pnl && Object.keys(s.time_pnl).length;
+    const labels = hasTP ? Object.keys(s.time_pnl) : ['Open','T1','T2','T3','T4','T5'];
+    const data   = hasTP ? Object.values(s.time_pnl) : [0,(s.net_pnl||0)*.2,(s.net_pnl||0)*.45,(s.net_pnl||0)*.7,(s.net_pnl||0)*.9,(s.net_pnl||0)];
+    const cum = [0]; for (const v of data) cum.push(cum[cum.length-1]+v);
+    const pos = cum[cum.length-1] >= 0;
+    CHARTS.eq = new Chart(eq, {type:'line',data:{labels:['Open',...labels],datasets:[{data:cum,borderColor:pos?'#3fb950':'#f85149',backgroundColor:pos?'rgba(63,185,80,.06)':'rgba(248,81,73,.06)',fill:true,tension:.4,pointRadius:0,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:9}}},y:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:9}}}}}});
+  }
+  const cp = document.getElementById('cepe-chart');
+  if (cp) {
+    CHARTS.cepe = new Chart(cp, {type:'bar',data:{labels:['CE P&L','PE P&L','Net P&L'],datasets:[{data:[s.ce_pnl||0,s.pe_pnl||0,s.net_pnl||0],backgroundColor:[(s.ce_pnl||0)>=0?'rgba(63,185,80,.7)':'rgba(248,81,73,.7)',(s.pe_pnl||0)>=0?'rgba(63,185,80,.7)':'rgba(248,81,73,.7)',(s.net_pnl||0)>=0?'rgba(88,166,255,.7)':'rgba(248,81,73,.7)'],borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:10}}},y:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:9}}}}}});
   }
 }
 
-// ══════════════════════════════════════
-//  SELECTS
-// ══════════════════════════════════════
-function populateSelects() {
-  const opts = sessions.map(s => `<option value="${s.id}">${s.full||s.date} — ${s.index||s.index_name}</option>`).join('');
-  document.getElementById('detail-select').innerHTML = opts;
-  document.getElementById('scoring-select').innerHTML = opts;
-  if (sessions.length) {
-    const lastId = sessions[sessions.length-1].id;
-    document.getElementById('detail-select').value = lastId;
-    document.getElementById('scoring-select').value = lastId;
+function buildScoringCharts() {
+  const s = CUR; if (!s) return;
+  const rn = document.getElementById('ring-chart');
+  if (rn) {
+    const ov = s.scores.overall;
+    CHARTS.ring = new Chart(rn, {type:'doughnut',data:{datasets:[{data:[ov,100-ov],backgroundColor:[ov>=65?'#3fb950':ov>=45?'#d29922':'#f85149','#1e2530'],borderWidth:0,circumference:270,rotation:225}]},options:{responsive:false,plugins:{legend:{display:false},tooltip:{enabled:false}},cutout:'72%'}});
   }
 }
 
-// Close modal outside click
-document.getElementById('add-modal').addEventListener('click', function(e) {
-  if (e.target === this) closeAddModal();
-});
+function buildTrendCharts() {
+  const sorted = [...SESSIONS].sort((a,b)=>a.id.localeCompare(b.id));
+  const labels = sorted.map(s=>s.date||s.full);
+  const rc = document.getElementById('roi-chart');
+  if (rc) CHARTS.roi = new Chart(rc, {type:'bar',data:{labels,datasets:[{data:sorted.map(s=>+((s.net_roi||0).toFixed(4))),backgroundColor:sorted.map(s=>(s.net_roi||0)>=0?'rgba(63,185,80,.7)':'rgba(248,81,73,.7)'),borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:10}}},y:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:9},callback:v=>v+'%'}}}}});
+  const sc2 = document.getElementById('score-chart');
+  if (sc2) CHARTS.score = new Chart(sc2, {type:'line',data:{labels,datasets:[{label:'Overall',data:sorted.map(s=>s.scores.overall),borderColor:'#58a6ff',tension:.4,pointRadius:3,borderWidth:2},{label:'Discipline',data:sorted.map(s=>s.scores.discipline),borderColor:'#3fb950',tension:.4,pointRadius:3,borderWidth:1.5,borderDash:[4,4]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:10}}},y:{grid:{color:'#2a3441'},min:0,max:100,ticks:{color:'#8b949e',font:{size:9}}}}}});
+  const vc = document.getElementById('vix-chart');
+  if (vc) CHARTS.vix = new Chart(vc, {type:'scatter',data:{datasets:[{data:sorted.map(s=>({x:s.vix||0,y:+((s.net_roi||0).toFixed(4))})),backgroundColor:sorted.map(s=>(s.net_roi||0)>=0?'rgba(63,185,80,.7)':'rgba(248,81,73,.7)'),pointRadius:6}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},title:{display:true,text:'India VIX',color:'#8b949e',font:{size:10}},ticks:{color:'#8b949e',font:{size:9}}},y:{grid:{color:'#2a3441'},title:{display:true,text:'Net ROI %',color:'#8b949e',font:{size:10}},ticks:{color:'#8b949e',font:{size:9},callback:v=>v+'%'}}}}});
+  const cp2 = document.getElementById('cepe2-chart');
+  if (cp2) CHARTS.cepe2 = new Chart(cp2, {type:'bar',data:{labels,datasets:[{label:'CE P&L',data:sorted.map(s=>s.ce_pnl||0),backgroundColor:'rgba(248,81,73,.65)',borderRadius:3},{label:'PE P&L',data:sorted.map(s=>s.pe_pnl||0),backgroundColor:'rgba(63,185,80,.65)',borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:10}}},y:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:9},callback:v=>v>=0?'₹'+(v/100000).toFixed(1)+'L':'−₹'+(Math.abs(v)/100000).toFixed(1)+'L'}}}}});
+}
 
-window.addEventListener('resize', () => { drawEquityChart(); drawScoreChart(); });
+// ══════════════════════════════════════════════════════════════
+//  EXPORT
+// ══════════════════════════════════════════════════════════════
+function exportAllJSON() {
+  const j = JSON.stringify(SESSIONS, null, 2);
+  const a = document.createElement('a');
+  a.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(j);
+  a.download = 'VJ_Sessions_Backup.json'; a.click();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  UTILITIES
+// ══════════════════════════════════════════════════════════════
+function noSession() {
+  return `<div class="empty">
+    <span class="empty-ico">📂</span>
+    <div class="empty-txt">No session selected</div>
+    <div class="empty-sub">Upload a CSV or select a session from Session History</div>
+    <div style="margin-top:14px;display:flex;gap:10px;justify-content:center">
+      <button class="btn btn-pr" onclick="setView('upload')">📂 Upload CSV</button>
+      <button class="btn btn-sm" onclick="setView('sessions')">View Sessions</button>
+    </div>
+  </div>`;
+}
+function fmtInr(v) {
+  const sign = v<0?'−':v>0?'+':'';
+  const a = Math.abs(v);
+  return `${sign}₹${a>=10000000?(a/10000000).toFixed(2)+'Cr':a>=100000?(a/100000).toFixed(2)+'L':a.toLocaleString('en-IN')}`;
+}
+function fmtCr(v) { return v>=10000000?(v/10000000).toFixed(2)+'Cr':v>=100000?(v/100000).toFixed(0)+'L':(v||0).toLocaleString('en-IN'); }
+function scCol(s) { return s>=65?'var(--gr)':s>=45?'var(--am)':'var(--rd)'; }
+function scLbl(s) { return s>=80?'Exceptional':s>=65?'Good':s>=50?'Average':s>=35?'Below Avg':'Poor'; }
+function getTodayId() { return new Date().toISOString().slice(0,10); }
+function toast(msg, type='') {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`; el.textContent = msg;
+  document.getElementById('toast-wrap').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
 </script>
 </body>
 </html>
+"""
