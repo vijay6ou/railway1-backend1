@@ -1,35 +1,47 @@
 """
-VJ Trading Dashboard — Database Setup
-SQLAlchemy engine, session factory, and Base for all models.
+Indian Options Regulatory Charge Engine
+Covers: STT, NSE Exchange Fee, SEBI Charges, Stamp Duty, GST
+Post-Budget 2024 rates
 """
-import os
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "sqlite:///./vj_trading.db"
-)
+def compute_charges(
+    total_buy_value: float,
+    total_sell_value: float,
+    total_turnover: float
+) -> dict:
+    """
+    Compute all regulatory charges for Indian options trading.
 
-# Railway PostgreSQL uses postgres:// but SQLAlchemy needs postgresql://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    Args:
+        total_buy_value:  Sum of (premium * qty) for all buy orders
+        total_sell_value: Sum of (premium * qty) for all sell orders
+        total_turnover:   total_buy_value + total_sell_value
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-)
+    Returns:
+        dict with individual charges and total
+    """
+    # STT: 0.1% on sell side only (options sell)
+    stt = total_sell_value * 0.001
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    # NSE Exchange Transaction Fee: 0.053% on total turnover
+    exchange = total_turnover * 0.00053
 
-Base = declarative_base()
+    # SEBI Charges: ₹10 per crore of turnover
+    sebi = (total_turnover / 1_00_00_000) * 10
 
+    # Stamp Duty: 0.003% on buy side only
+    stamp = total_buy_value * 0.00003
 
-def get_db():
-    """FastAPI dependency — yields a DB session and closes it after use."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    # GST: 18% on (exchange fee + SEBI charges)
+    gst = (exchange + sebi) * 0.18
+
+    total = stt + exchange + sebi + stamp + gst
+
+    return {
+        "stt":      round(stt, 2),
+        "exchange": round(exchange, 2),
+        "sebi":     round(sebi, 2),
+        "stamp":    round(stamp, 2),
+        "gst":      round(gst, 2),
+        "total":    round(total, 2)
+    }
