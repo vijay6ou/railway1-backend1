@@ -217,6 +217,18 @@ label{font-size:11px;color:var(--tx2);margin-bottom:4px;display:block;font-weigh
 /* ── JOURNAL / CHART UPLOAD ── */
 .drop-sm{border:2px dashed var(--bd2);border-radius:8px;padding:16px;text-align:center;cursor:pointer;transition:all .2s;background:var(--s2);font-size:12px;color:var(--tx2)}
 .drop-sm:hover{border-color:var(--bl);color:var(--bl)}
+
+/* ── TRENDS PAGE ── */
+.tr-stat-strip{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:4px}
+@media(max-width:900px){.tr-stat-strip{grid-template-columns:repeat(3,1fr)}}
+.chart-wrap-lg{position:relative;height:320px}
+
+/* ── JOURNAL MULTI-CHART GALLERY ── */
+.jrn-gallery{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-bottom:14px}
+.jrn-chart-card{background:var(--s2);border:1px solid var(--bd);border-radius:8px;overflow:hidden;transition:border-color .15s}
+.jrn-chart-card:hover{border-color:var(--bl)}
+.jrn-chart-card img{width:100%;height:280px;object-fit:contain;display:block;cursor:zoom-in;background:var(--s3)}
+.jrn-chart-footer{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;border-top:1px solid var(--bd);background:var(--s1)}
 </style>
 </head>
 <body>
@@ -299,7 +311,7 @@ let CUR_VIEW = 'upload';
 let USER_ROLE = 'readonly';
 
 // RAW CSV state
-let RAW = { trades:[], agg:{}, carry:{}, metrics:null, chartFile:null };
+let RAW = { trades:[], agg:{}, carry:{}, metrics:null, chartFile:null, csvFile:null };
 
 const getToken = () => localStorage.getItem(TOKEN_KEY);
 
@@ -342,6 +354,7 @@ async function loadSessions() {
     dte: s.dte || 0,
     chart_img: s.chart_image || null,
     charges_breakdown: s.charges_breakdown || {},
+    journal_charts: s.journal_charts || [],
   }));
   SESSIONS.sort((a,b) => b.id.localeCompare(a.id));
   updateSessCount();
@@ -349,27 +362,29 @@ async function loadSessions() {
 
 async function saveSession(sess) {
   // Map dashboard fields to API schema
+  // Use explicit null checks to avoid dropping valid 0 values
+  const nn = (v) => (v != null ? v : null);
   const body = {
     id: sess.id,
     date: sess.date,
     full: sess.full,
     index_name: sess.index || sess.index_name || 'Nifty',
-    dte: sess.dte || 0,
-    vix: sess.vix || null,
-    capital: sess.capital || null,
-    gross_pnl: sess.gross_pnl || null,
-    net_pnl: sess.net_pnl || null,
-    net_roi: sess.net_roi || null,
-    gross_roi: sess.gross_roi || null,
-    ce_pnl: sess.ce_pnl || null,
-    pe_pnl: sess.pe_pnl || null,
-    charges: sess.charges || null,
-    executed: sess.executed || null,
-    rejected: sess.rejected || null,
-    mt: sess.mt || null,
-    carry_out: sess.carry_out || 0,
+    dte: sess.dte != null ? sess.dte : 0,
+    vix: nn(sess.vix),
+    capital: nn(sess.capital),
+    gross_pnl: nn(sess.gross_pnl),
+    net_pnl: nn(sess.net_pnl),
+    net_roi: nn(sess.net_roi),
+    gross_roi: nn(sess.gross_roi),
+    ce_pnl: nn(sess.ce_pnl),
+    pe_pnl: nn(sess.pe_pnl),
+    charges: nn(sess.charges),
+    executed: nn(sess.executed),
+    rejected: nn(sess.rejected),
+    mt: nn(sess.mt),
+    carry_out: sess.carry_out != null ? sess.carry_out : 0,
     note: sess.notes || sess.note || null,
-    journal: sess.journal || null,
+    journal: sess.journal != null ? sess.journal : null,
     peer_rois: sess.peer_rois || [],
     scores: sess.scores || {overall:0,discipline:0,cap_eff:0,trade_q:0,mkt_align:0,vol_handle:0,peer_cmp:0},
     violations: sess.violations || [],
@@ -496,7 +511,7 @@ function afterRender() {
   updateTopbar();
   if (CUR_VIEW === 'overview') buildOverviewCharts();
   if (CUR_VIEW === 'scoring')  buildScoringCharts();
-  if (CUR_VIEW === 'trends')   buildTrendCharts();
+  if (CUR_VIEW === 'trends')   { TREND_FROM = ''; TREND_TO = ''; buildTrendCharts(); }
   if (CUR_VIEW === 'journal')  bindJournalEvents();
 }
 
@@ -651,6 +666,7 @@ function handleDrop(e) {
 }
 function handleFileInput(inp) { if (inp.files[0]) parseCSV(inp.files[0]); }
 function parseCSV(file) {
+  RAW.csvFile = file;  // keep raw File reference for backend upload
   Papa.parse(file, {
     header:true, skipEmptyLines:true,
     complete(res) { processCSV(res.data); }
@@ -834,14 +850,25 @@ async function saveFromUpload() {
   };
   try {
     await saveSession(sess);
+    // Upload raw CSV to backend for server-side parsing (strikes, charges, time_pnl)
+    if (RAW.csvFile) {
+      const fd = new FormData();
+      fd.append('file', RAW.csvFile, RAW.csvFile.name || 'orderbook.csv');
+      const csvRes = await fetch(`/upload-csv/${dateId}`, {
+        method:'POST', headers:{'Authorization':`Bearer ${getToken()}`}, body:fd
+      });
+      if (!csvRes.ok) {
+        const e = await csvRes.json().catch(()=>({}));
+        toast(`CSV parse warning: ${e.detail||'check format'}`, '');
+      }
+    }
     // Upload chart if attached
     if (RAW.chartFile && RAW.chartFile.startsWith('data:image')) {
       const res = await fetch(RAW.chartFile);
       const blob = await res.blob();
       const fd = new FormData();
       fd.append('file', blob, 'chart.png');
-      const token = getToken();
-      await fetch(`/upload-chart/${dateId}`, { method:'POST', headers:{'Authorization':`Bearer ${token}`}, body:fd });
+      await fetch(`/upload-chart/${dateId}`, { method:'POST', headers:{'Authorization':`Bearer ${getToken()}`}, body:fd });
     }
     await loadSessions();
     CUR = SESSIONS.find(s => s.id === dateId) || SESSIONS[0];
@@ -857,7 +884,7 @@ function parseStrike(sym) {
 }
 
 function resetUpload() {
-  RAW = {trades:[],agg:{},carry:{},metrics:null,chartFile:null};
+  RAW = {trades:[],agg:{},carry:{},metrics:null,chartFile:null,csvFile:null};
   renderView();
 }
 
@@ -1035,10 +1062,10 @@ function vCharges() {
   const s = CUR, cb = s.charges_breakdown || {};
   const cr = s.gross_pnl>0 ? (s.charges/s.gross_pnl*100).toFixed(2) : 'N/A';
   const items = [
-    ['STT (0.15% on sell side)', cb.stt||0],
-    ['NSE Exchange Fee (0.053% both)', cb.exchange||0],
+    ['STT (0.1% on sell side)', cb.stt||0],
+    ['NSE Exchange Fee (0.053% both sides)', cb.exchange||0],
     ['SEBI Fee (₹10 per Crore)', cb.sebi||0],
-    ['Stamp Duty (0.003% on buy)', cb.stamp||0],
+    ['Stamp Duty (0.003% on buy side)', cb.stamp||0],
     ['GST (18% on Exchange+SEBI)', cb.gst||0],
     ['Brokerage', cb.brokerage||0],
   ];
@@ -1060,59 +1087,145 @@ function vCharges() {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  JOURNAL VIEW
+//  JOURNAL VIEW  — multi-chart gallery + lightbox
 // ══════════════════════════════════════════════════════════════
 function vJournal() {
   if (!CUR) return noSession();
   const s = CUR;
+  const charts = s.journal_charts || [];
+  const isAdmin = USER_ROLE === 'admin';
+
+  const galleryHtml = charts.length ? `
+    <div class="jrn-gallery">
+      ${charts.map((src, i) => `
+        <div class="jrn-chart-card">
+          <img src="${src}" alt="Chart ${i+1}" onclick="openLightbox(${i})" title="Click to enlarge">
+          <div class="jrn-chart-footer">
+            <span style="font-size:11px;color:var(--tx3)">Chart ${i+1}</span>
+            ${isAdmin ? `<button class="btn btn-sm btn-rd" onclick="deleteJournalChart(${i})">✕ Remove</button>` : ''}
+          </div>
+        </div>`).join('')}
+    </div>` : `<div style="font-size:12px;color:var(--tx3);padding:10px 0">No charts uploaded yet.</div>`;
+
   return `
+    <!-- LIGHTBOX -->
+    <div id="jrn-lightbox" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:9999;align-items:center;justify-content:center;flex-direction:column" onclick="closeLightbox()">
+      <img id="jrn-lb-img" src="" alt="chart" style="max-width:95vw;max-height:90vh;border-radius:8px;object-fit:contain">
+      <div style="margin-top:12px;display:flex;gap:12px">
+        <button class="btn btn-sm" onclick="event.stopPropagation();lbNav(-1)">‹ Prev</button>
+        <span id="jrn-lb-label" style="font-size:12px;color:var(--tx2);align-self:center"></span>
+        <button class="btn btn-sm" onclick="event.stopPropagation();lbNav(1)">Next ›</button>
+      </div>
+      <div style="font-size:11px;color:var(--tx3);margin-top:8px">Click anywhere or press ESC to close</div>
+    </div>
+
     <div class="card">
       <div class="card-title">Trade Journal — ${s.full}
-        <span class="card-badge">${s.index} · VIX ${s.vix||'—'}</span>
+        <span class="card-badge">${s.index||s.index_name} · VIX ${s.vix||'—'}</span>
       </div>
-      ${s.chart_img ? `
-        <div class="card-title" style="margin-top:10px">Session Chart</div>
-        <div class="chart-img-wrap" style="margin-bottom:14px"><img src="${s.chart_img}" alt="chart"></div>
-      ` : ''}
-      <div class="admin-only">
-        <div style="margin-bottom:8px">
-          <button class="btn btn-sm" onclick="document.getElementById('jrn-chart-inp').click()">📷 Upload/Replace Chart</button>
-          <input type="file" id="jrn-chart-inp" accept="image/*" style="display:none" onchange="uploadChartFromJournal(this)">
-          ${s.chart_img ? `<button class="btn btn-sm btn-rd" style="margin-left:8px" onclick="deleteChartFromJournal()">Remove Chart</button>` : ''}
-        </div>
+
+      <!-- CHART GALLERY -->
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <div class="card-title" style="margin:0">Session Charts <span class="card-badge">${charts.length}</span></div>
+        ${isAdmin ? `<div>
+          <button class="btn btn-sm" onclick="document.getElementById('jrn-chart-inp').click()">📷 Add Chart</button>
+          <input type="file" id="jrn-chart-inp" accept="image/*" style="display:none" onchange="addJournalChart(this)">
+        </div>` : ''}
       </div>
-      <div class="card-title" style="margin-top:14px">Notes</div>
-      <div class="admin-only">
+      ${galleryHtml}
+
+      <!-- NOTES -->
+      <div class="card-title" style="margin-top:18px">Notes</div>
+      ${isAdmin ? `
         <textarea id="jrn-text" rows="10" placeholder="Pre-market plan, trade rationale, post-session observations, lessons learned…">${s.journal||''}</textarea>
         <div class="btn-row" style="margin-top:10px">
-          <button class="btn btn-gr btn-sm" onclick="saveJournal()">💾 Save Journal</button>
+          <button class="btn btn-gr btn-sm" onclick="saveJournal()">💾 Save Notes</button>
         </div>
-      </div>
-      ${USER_ROLE !== 'admin' ? `<div style="white-space:pre-wrap;font-size:13px;line-height:1.8;color:var(--tx2);font-family:var(--fm)">${s.journal||'<span style="color:var(--tx3)">No journal entry</span>'}</div>` : ''}
+      ` : `<div style="white-space:pre-wrap;font-size:13px;line-height:1.8;color:var(--tx2);font-family:var(--fm)">${s.journal||'<span style="color:var(--tx3)">No journal entry</span>'}</div>`}
     </div>`;
 }
 
-function bindJournalEvents() {}
+// Lightbox state
+let LB_IDX = 0;
+
+function openLightbox(idx) {
+  const charts = CUR?.journal_charts || [];
+  if (!charts.length) return;
+  LB_IDX = idx;
+  const lb = document.getElementById('jrn-lightbox');
+  document.getElementById('jrn-lb-img').src = charts[idx];
+  document.getElementById('jrn-lb-label').textContent = `${idx+1} / ${charts.length}`;
+  lb.style.display = 'flex';
+}
+
+function closeLightbox() {
+  document.getElementById('jrn-lightbox').style.display = 'none';
+}
+
+function lbNav(dir) {
+  const charts = CUR?.journal_charts || [];
+  LB_IDX = (LB_IDX + dir + charts.length) % charts.length;
+  document.getElementById('jrn-lb-img').src = charts[LB_IDX];
+  document.getElementById('jrn-lb-label').textContent = `${LB_IDX+1} / ${charts.length}`;
+}
+
+let _jrnKeyBound = false;
+function bindJournalEvents() {
+  if (_jrnKeyBound) return;
+  _jrnKeyBound = true;
+  document.addEventListener('keydown', e => {
+    if (CUR_VIEW !== 'journal') return;
+    if (e.key === 'Escape')      closeLightbox();
+    if (e.key === 'ArrowLeft')   lbNav(-1);
+    if (e.key === 'ArrowRight')  lbNav(1);
+  });
+}
 
 async function saveJournal() {
   if (!CUR || USER_ROLE !== 'admin') return;
-  const journal = document.getElementById('jrn-text')?.value || '';
+  const journal = document.getElementById('jrn-text')?.value ?? '';
   try {
     await saveSession({...CUR, journal});
     await loadSessions();
     CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
-    CUR.journal = journal;
-    toast('Journal saved', 'ok');
+    toast('Notes saved', 'ok');
   } catch(e) { toast(e.message, 'err'); }
 }
 
+async function addJournalChart(inp) {
+  if (!CUR || !inp.files[0]) return;
+  const fd = new FormData();
+  fd.append('file', inp.files[0]);
+  try {
+    const res = await fetch(`/journal-chart/${CUR.id}`, {
+      method:'POST', headers:{'Authorization':`Bearer ${getToken()}`}, body:fd
+    });
+    if (!res.ok) { const e=await res.json(); throw new Error(e.detail); }
+    await loadSessions();
+    CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
+    renderView();
+    toast('Chart added', 'ok');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+async function deleteJournalChart(idx) {
+  if (!CUR) return;
+  try {
+    await apiFetch(`/journal-chart/${CUR.id}/${idx}`, { method:'DELETE' });
+    await loadSessions();
+    CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
+    renderView();
+    toast('Chart removed', 'ok');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+// Legacy single-chart upload (kept for backward compat from upload view)
 async function uploadChartFromJournal(inp) {
   if (!CUR || !inp.files[0]) return;
   const fd = new FormData();
   fd.append('file', inp.files[0]);
-  const token = getToken();
   try {
-    const res = await fetch(`/upload-chart/${CUR.id}`, { method:'POST', headers:{'Authorization':`Bearer ${token}`}, body:fd });
+    const res = await fetch(`/upload-chart/${CUR.id}`, { method:'POST', headers:{'Authorization':`Bearer ${getToken()}`}, body:fd });
     if (!res.ok) { const e=await res.json(); throw new Error(e.detail); }
     await loadSessions();
     CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
@@ -1179,32 +1292,81 @@ function selectSession(id) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  TRENDS VIEW
+//  TRENDS VIEW  — complete redesign
 // ══════════════════════════════════════════════════════════════
-function vTrends() {
-  if (SESSIONS.length < 2) return `<div class="empty"><span class="empty-ico">📈</span><div class="empty-txt">Need at least 2 sessions</div></div>`;
-  const sorted = [...SESSIONS].sort((a,b)=>a.id.localeCompare(b.id));
-  return `
-    <div class="grid2">
-      <div class="card"><div class="card-title">Net ROI per Session</div><div class="chart-wrap"><canvas id="roi-chart"></canvas></div></div>
-      <div class="card"><div class="card-title">Score Trend</div><div class="chart-wrap"><canvas id="score-chart"></canvas></div></div>
-    </div>
-    <div class="card"><div class="card-title">VIX vs Net ROI</div><div class="chart-wrap"><canvas id="vix-chart"></canvas></div></div>
-    <div class="card"><div class="card-title">CE vs PE Comparison</div><div class="chart-wrap"><canvas id="cepe2-chart"></canvas></div></div>
-    <div class="card"><div class="card-title">Summary Statistics</div><div class="grid4">${trendStats(sorted)}</div></div>`;
-}
+let TREND_FROM = '';
+let TREND_TO   = '';
 
-function trendStats(ss) {
-  const nets = ss.map(s=>s.net_roi||0);
-  const wins = nets.filter(r=>r>0);
-  const totalNet = ss.reduce((a,s)=>a+(s.net_pnl||0),0);
-  const avgScore = Math.round(ss.reduce((a,s)=>a+s.scores.overall,0)/ss.length);
-  return [
-    ['Total Sessions',ss.length,''],
-    ['Win Rate',`${Math.round(wins.length/nets.length*100)}%`,wins.length+' winning'],
-    ['Total Net P&L',fmtInr(totalNet),totalNet>=0?'pos':'neg'],
-    ['Avg Score',`${avgScore}/100`,avgScore>=65?'pos':avgScore>=45?'neu':'neg'],
-  ].map(([l,v,cls])=>`<div class="mc"><div class="mc-lbl">${l}</div><div class="mc-val ${cls}">${v}</div></div>`).join('');
+function vTrends() {
+  if (SESSIONS.length < 2) return `<div class="empty"><span class="empty-ico">📈</span><div class="empty-txt">Need at least 2 sessions</div><div class="empty-sub">Add more sessions to see trend analysis</div></div>`;
+  const sorted = [...SESSIONS].sort((a,b)=>a.id.localeCompare(b.id));
+
+  // Initialise date filter bounds
+  if (!TREND_FROM) TREND_FROM = sorted[0].id;
+  if (!TREND_TO)   TREND_TO   = sorted[sorted.length-1].id;
+
+  // Summary stats
+  const nets    = sorted.map(s=>s.net_roi||0);
+  const wins    = nets.filter(r=>r>0);
+  const totalNet= sorted.reduce((a,s)=>a+(s.net_pnl||0),0);
+  const avgScore= Math.round(sorted.reduce((a,s)=>a+(s.scores?.overall||0),0)/sorted.length);
+  const best    = sorted.reduce((a,s)=>(s.net_roi||0)>(a.net_roi||0)?s:a, sorted[0]);
+  const worst   = sorted.reduce((a,s)=>(s.net_roi||0)<(a.net_roi||0)?s:a, sorted[0]);
+
+  return `
+    <!-- ① SUMMARY STRIP -->
+    <div class="tr-stat-strip">
+      <div class="mc"><div class="mc-lbl">Sessions</div><div class="mc-val">${sorted.length}</div><div class="mc-sub">${wins.length} winning</div></div>
+      <div class="mc"><div class="mc-lbl">Win Rate</div><div class="mc-val ${wins.length/sorted.length>=0.5?'pos':'neg'}">${Math.round(wins.length/sorted.length*100)}%</div><div class="mc-sub">${sorted.length-wins.length} losing</div></div>
+      <div class="mc"><div class="mc-lbl">Total Net P&L</div><div class="mc-val ${totalNet>=0?'pos':'neg'}">${fmtInr(totalNet)}</div><div class="mc-sub">all sessions</div></div>
+      <div class="mc"><div class="mc-lbl">Avg Score</div><div class="mc-val" style="color:${scCol(avgScore)}">${avgScore}/100</div><div class="mc-sub">${scLbl(avgScore)}</div></div>
+      <div class="mc"><div class="mc-lbl">Best Session</div><div class="mc-val pos">+${(best.net_roi||0).toFixed(3)}%</div><div class="mc-sub">${best.date||best.full}</div></div>
+      <div class="mc"><div class="mc-lbl">Worst Session</div><div class="mc-val neg">${(worst.net_roi||0).toFixed(3)}%</div><div class="mc-sub">${worst.date||worst.full}</div></div>
+    </div>
+
+    <!-- ② DAY-WISE P&L (stacked: net pnl + charges) -->
+    <div class="card">
+      <div class="card-title">Day-wise P&L
+        <span class="card-badge">gross = net + charges · green/red bar · amber = charges</span>
+      </div>
+      <div class="chart-wrap-lg"><canvas id="tr-daypnl-chart"></canvas></div>
+    </div>
+
+    <!-- ③ EFFICIENCY: gross ROI vs net ROI -->
+    <div class="card">
+      <div class="card-title">Efficiency — Gross ROI vs Net ROI
+        <span class="card-badge">gap = charges drag</span>
+      </div>
+      <div class="chart-wrap"><canvas id="tr-eff-chart"></canvas></div>
+    </div>
+
+    <!-- ④ CUMULATIVE NET P&L with date filter -->
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+        <div class="card-title" style="margin:0">Cumulative Net P&L</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="font-size:11px;color:var(--tx2)">From</label>
+          <input type="date" id="tr-from" value="${TREND_FROM}" style="background:var(--s3);border:1px solid var(--bd);color:var(--tx);font-size:12px;border-radius:5px;padding:4px 8px" onchange="TREND_FROM=this.value;rebuildCumulativeChart()">
+          <label style="font-size:11px;color:var(--tx2)">To</label>
+          <input type="date" id="tr-to" value="${TREND_TO}" style="background:var(--s3);border:1px solid var(--bd);color:var(--tx);font-size:12px;border-radius:5px;padding:4px 8px" onchange="TREND_TO=this.value;rebuildCumulativeChart()">
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="tr-cum-chart"></canvas></div>
+    </div>
+
+    <!-- ⑤ VIX vs Net ROI scatter -->
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title">VIX vs Net ROI <span class="card-badge">scatter · size = |P&L|</span></div>
+        <div class="chart-wrap"><canvas id="tr-vix-chart"></canvas></div>
+      </div>
+
+      <!-- ⑥ DTE vs Net ROI -->
+      <div class="card">
+        <div class="card-title">DTE vs Avg Net ROI <span class="card-badge">grouped by days-to-expiry</span></div>
+        <div class="chart-wrap"><canvas id="tr-dte-chart"></canvas></div>
+      </div>
+    </div>`;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1387,14 +1549,19 @@ async function saveFromForm() {
 // ══════════════════════════════════════════════════════════════
 async function generateAI(id) {
   if (USER_ROLE !== 'admin') { toast('Admin only','err'); return; }
-  toast('Generating AI commentary…','');
+  toast('Generating AI commentary via Grok…','');
   try {
     await apiFetch(`/ai-commentary/${id}`, { method:'POST' });
     await loadSessions();
     CUR = SESSIONS.find(s=>s.id===id) || CUR;
     renderView();
     toast('AI commentary generated','ok');
-  } catch(e) { toast(e.message,'err'); }
+  } catch(e) {
+    const msg = e.message.includes('GROK_API_KEY')
+      ? 'Set GROK_API_KEY in Railway environment variables'
+      : e.message;
+    toast(msg,'err');
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1428,15 +1595,189 @@ function buildScoringCharts() {
 
 function buildTrendCharts() {
   const sorted = [...SESSIONS].sort((a,b)=>a.id.localeCompare(b.id));
-  const labels = sorted.map(s=>s.date||s.full);
-  const rc = document.getElementById('roi-chart');
-  if (rc) CHARTS.roi = new Chart(rc, {type:'bar',data:{labels,datasets:[{data:sorted.map(s=>+((s.net_roi||0).toFixed(4))),backgroundColor:sorted.map(s=>(s.net_roi||0)>=0?'rgba(63,185,80,.7)':'rgba(248,81,73,.7)'),borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:10}}},y:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:9},callback:v=>v+'%'}}}}});
-  const sc2 = document.getElementById('score-chart');
-  if (sc2) CHARTS.score = new Chart(sc2, {type:'line',data:{labels,datasets:[{label:'Overall',data:sorted.map(s=>s.scores.overall),borderColor:'#58a6ff',tension:.4,pointRadius:3,borderWidth:2},{label:'Discipline',data:sorted.map(s=>s.scores.discipline),borderColor:'#3fb950',tension:.4,pointRadius:3,borderWidth:1.5,borderDash:[4,4]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:10}}},y:{grid:{color:'#2a3441'},min:0,max:100,ticks:{color:'#8b949e',font:{size:9}}}}}});
-  const vc = document.getElementById('vix-chart');
-  if (vc) CHARTS.vix = new Chart(vc, {type:'scatter',data:{datasets:[{data:sorted.map(s=>({x:s.vix||0,y:+((s.net_roi||0).toFixed(4))})),backgroundColor:sorted.map(s=>(s.net_roi||0)>=0?'rgba(63,185,80,.7)':'rgba(248,81,73,.7)'),pointRadius:6}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},title:{display:true,text:'India VIX',color:'#8b949e',font:{size:10}},ticks:{color:'#8b949e',font:{size:9}}},y:{grid:{color:'#2a3441'},title:{display:true,text:'Net ROI %',color:'#8b949e',font:{size:10}},ticks:{color:'#8b949e',font:{size:9},callback:v=>v+'%'}}}}});
-  const cp2 = document.getElementById('cepe2-chart');
-  if (cp2) CHARTS.cepe2 = new Chart(cp2, {type:'bar',data:{labels,datasets:[{label:'CE P&L',data:sorted.map(s=>s.ce_pnl||0),backgroundColor:'rgba(248,81,73,.65)',borderRadius:3},{label:'PE P&L',data:sorted.map(s=>s.pe_pnl||0),backgroundColor:'rgba(63,185,80,.65)',borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:10}}},y:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:9},callback:v=>v>=0?'₹'+(v/100000).toFixed(1)+'L':'−₹'+(Math.abs(v)/100000).toFixed(1)+'L'}}}}});
+  const labels = sorted.map(s=>s.date||s.id.slice(5));  // "Apr 10" or "04-10"
+
+  const GX = '#2a3441';  // grid line colour
+  const TX = '#8b949e';  // tick colour
+  const baseOpts = (yFmt) => ({
+    responsive:true, maintainAspectRatio:false,
+    plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>yFmt?yFmt(ctx.parsed.y):ctx.parsed.y}}},
+    scales:{
+      x:{grid:{color:GX},ticks:{color:TX,font:{size:10},maxRotation:45}},
+      y:{grid:{color:GX},ticks:{color:TX,font:{size:9}}}
+    }
+  });
+
+  // ② DAY-WISE P&L — stacked: net_pnl (colour) + charges (amber)
+  const dpEl = document.getElementById('tr-daypnl-chart');
+  if (dpEl) {
+    const netData    = sorted.map(s => s.net_pnl    || 0);
+    const chargeData = sorted.map(s => s.charges     || 0);
+    const netColors  = netData.map(v => v >= 0 ? 'rgba(63,185,80,.75)' : 'rgba(248,81,73,.75)');
+    CHARTS.daypnl = new Chart(dpEl, {
+      type:'bar',
+      data:{ labels, datasets:[
+        { label:'Net P&L', data:netData, backgroundColor:netColors, borderRadius:3, order:1 },
+        { label:'Charges', data:chargeData, backgroundColor:'rgba(210,153,34,.55)', borderRadius:3, order:2 }
+      ]},
+      options:{ ...baseOpts(),
+        plugins:{
+          legend:{display:true,position:'top',labels:{color:TX,boxWidth:12,font:{size:10}}},
+          tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${fmtInr(ctx.parsed.y)}`}}
+        },
+        scales:{
+          x:{stacked:false,grid:{color:GX},ticks:{color:TX,font:{size:10},maxRotation:45}},
+          y:{stacked:false,grid:{color:GX},ticks:{color:TX,font:{size:9},callback:v=>fmtInr(v)}}
+        }
+      }
+    });
+  }
+
+  // ③ EFFICIENCY — grouped: gross_roi (light) vs net_roi (solid)
+  const effEl = document.getElementById('tr-eff-chart');
+  if (effEl) {
+    CHARTS.eff = new Chart(effEl, {
+      type:'bar',
+      data:{ labels, datasets:[
+        { label:'Gross ROI %', data:sorted.map(s=>+((s.gross_roi||0).toFixed(4))),
+          backgroundColor:sorted.map(s=>(s.gross_roi||0)>=0?'rgba(63,185,80,.35)':'rgba(248,81,73,.35)'),
+          borderColor:sorted.map(s=>(s.gross_roi||0)>=0?'rgba(63,185,80,.8)':'rgba(248,81,73,.8)'),
+          borderWidth:1, borderRadius:3 },
+        { label:'Net ROI %',   data:sorted.map(s=>+((s.net_roi||0).toFixed(4))),
+          backgroundColor:sorted.map(s=>(s.net_roi||0)>=0?'rgba(63,185,80,.75)':'rgba(248,81,73,.75)'),
+          borderRadius:3 }
+      ]},
+      options:{ ...baseOpts(),
+        plugins:{
+          legend:{display:true,position:'top',labels:{color:TX,boxWidth:12,font:{size:10}}},
+          tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${ctx.parsed.y.toFixed(4)}%`}}
+        },
+        scales:{
+          x:{grid:{color:GX},ticks:{color:TX,font:{size:10},maxRotation:45}},
+          y:{grid:{color:GX},ticks:{color:TX,font:{size:9},callback:v=>v+'%'}}
+        }
+      }
+    });
+  }
+
+  // ④ CUMULATIVE NET P&L
+  _buildCumulativeChart(sorted);
+
+  // ⑤ VIX vs Net ROI scatter with regression line
+  const vixEl = document.getElementById('tr-vix-chart');
+  if (vixEl) {
+    const pts = sorted.filter(s=>s.vix).map(s=>({
+      x: s.vix||0, y:+((s.net_roi||0).toFixed(4)), lbl: s.date||s.id
+    }));
+    // Simple linear regression
+    const n = pts.length;
+    const sumX  = pts.reduce((a,p)=>a+p.x,0);
+    const sumY  = pts.reduce((a,p)=>a+p.y,0);
+    const sumXY = pts.reduce((a,p)=>a+p.x*p.y,0);
+    const sumX2 = pts.reduce((a,p)=>a+p.x*p.x,0);
+    const slope = n?(n*sumXY - sumX*sumY)/(n*sumX2 - sumX*sumX):0;
+    const intercept = n?(sumY - slope*sumX)/n:0;
+    const xMin = Math.min(...pts.map(p=>p.x));
+    const xMax = Math.max(...pts.map(p=>p.x));
+    const regLine = [{x:xMin, y:+(slope*xMin+intercept).toFixed(4)}, {x:xMax, y:+(slope*xMax+intercept).toFixed(4)}];
+
+    CHARTS.vix = new Chart(vixEl, {
+      type:'scatter',
+      data:{ datasets:[
+        { label:'Sessions', data:pts.map(p=>({x:p.x,y:p.y})),
+          backgroundColor:pts.map(p=>p.y>=0?'rgba(63,185,80,.75)':'rgba(248,81,73,.75)'),
+          pointRadius:7, pointHoverRadius:9 },
+        { label:'Trend', data:regLine, type:'line',
+          borderColor:'rgba(88,166,255,.5)', borderWidth:1.5,
+          borderDash:[5,4], pointRadius:0, fill:false }
+      ]},
+      options:{
+        responsive:true, maintainAspectRatio:false,
+        plugins:{
+          legend:{display:false},
+          tooltip:{callbacks:{
+            label:ctx=>{ const p=pts[ctx.dataIndex]; return p?`${p.lbl}: VIX ${p.x} · ROI ${p.y}%`:`${ctx.parsed.x}, ${ctx.parsed.y}`; }
+          }}
+        },
+        scales:{
+          x:{grid:{color:GX},title:{display:true,text:'India VIX',color:TX,font:{size:10}},ticks:{color:TX,font:{size:9}}},
+          y:{grid:{color:GX},title:{display:true,text:'Net ROI %',color:TX,font:{size:10}},ticks:{color:TX,font:{size:9},callback:v=>v+'%'}}
+        }
+      }
+    });
+  }
+
+  // ⑥ DTE vs Avg Net ROI — bar grouped by DTE value
+  const dteEl = document.getElementById('tr-dte-chart');
+  if (dteEl) {
+    const dteMap = {};
+    sorted.forEach(s => {
+      const d = s.dte ?? 0;
+      if (!dteMap[d]) dteMap[d] = [];
+      dteMap[d].push(s.net_roi || 0);
+    });
+    const dteKeys  = Object.keys(dteMap).sort((a,b)=>+a-+b);
+    const dteAvgs  = dteKeys.map(d => +(dteMap[d].reduce((a,v)=>a+v,0)/dteMap[d].length).toFixed(4));
+    const dteCnts  = dteKeys.map(d => dteMap[d].length);
+    CHARTS.dte = new Chart(dteEl, {
+      type:'bar',
+      data:{ labels:dteKeys.map(d=>`DTE ${d}`), datasets:[{
+        label:'Avg Net ROI %',
+        data:dteAvgs,
+        backgroundColor:dteAvgs.map(v=>v>=0?'rgba(63,185,80,.75)':'rgba(248,81,73,.75)'),
+        borderRadius:4
+      }]},
+      options:{
+        responsive:true, maintainAspectRatio:false,
+        plugins:{
+          legend:{display:false},
+          tooltip:{callbacks:{label:ctx=>{
+            const idx=ctx.dataIndex;
+            return `Avg ROI: ${dteAvgs[idx]}% (${dteCnts[idx]} session${dteCnts[idx]>1?'s':''})`;
+          }}}
+        },
+        scales:{
+          x:{grid:{color:GX},ticks:{color:TX,font:{size:11}}},
+          y:{grid:{color:GX},ticks:{color:TX,font:{size:9},callback:v=>v+'%'}}
+        }
+      }
+    });
+  }
+}
+
+function _buildCumulativeChart(sortedSessions) {
+  const cumEl = document.getElementById('tr-cum-chart');
+  if (!cumEl) return;
+  const filtered = sortedSessions.filter(s => s.id >= TREND_FROM && s.id <= TREND_TO);
+  const labels = filtered.map(s=>s.date||s.id.slice(5));
+  let cum = 0;
+  const cumData = filtered.map(s=>{ cum += (s.net_pnl||0); return Math.round(cum); });
+  const pos = cum >= 0;
+
+  if (CHARTS.cum) { CHARTS.cum.destroy(); delete CHARTS.cum; }
+  CHARTS.cum = new Chart(cumEl, {
+    type:'line',
+    data:{ labels, datasets:[{
+      data: cumData,
+      borderColor: pos ? '#3fb950' : '#f85149',
+      backgroundColor: pos ? 'rgba(63,185,80,.08)' : 'rgba(248,81,73,.08)',
+      fill:true, tension:.4, pointRadius:4, borderWidth:2,
+      pointBackgroundColor:cumData.map(v=>v>=0?'#3fb950':'#f85149')
+    }]},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false}, tooltip:{callbacks:{label:ctx=>`Cumulative: ${fmtInr(ctx.parsed.y)}`}} },
+      scales:{
+        x:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:10},maxRotation:45}},
+        y:{grid:{color:'#2a3441'},ticks:{color:'#8b949e',font:{size:9},callback:v=>fmtInr(v)}}
+      }
+    }
+  });
+}
+
+function rebuildCumulativeChart() {
+  const sorted = [...SESSIONS].sort((a,b)=>a.id.localeCompare(b.id));
+  _buildCumulativeChart(sorted);
 }
 
 // ══════════════════════════════════════════════════════════════

@@ -15,6 +15,26 @@ from csv_parser import parse_orderbook_csv
 from seed import seed
 
 Base.metadata.create_all(bind=engine)
+
+# ── COLUMN MIGRATIONS (safe ADD COLUMN for existing deployments) ──
+def _migrate():
+    """Add new columns to existing sessions table without dropping data."""
+    new_cols = [
+        ("charges_breakdown_json", "TEXT DEFAULT '{}'"),
+        ("time_pnl_json",          "TEXT DEFAULT '{}'"),
+        ("journal_charts_json",    "TEXT DEFAULT '[]'"),
+    ]
+    with engine.connect() as conn:
+        for col, definition in new_cols:
+            try:
+                conn.execute(__import__("sqlalchemy").text(
+                    f"ALTER TABLE sessions ADD COLUMN {col} {definition}"
+                ))
+                conn.commit()
+            except Exception:
+                pass  # column already exists — ignore
+
+_migrate()
 seed()
 
 app = FastAPI(title="VJ Trading Dashboard", version="3.0.0",
@@ -129,17 +149,19 @@ async def upload_csv(session_id: str, file: UploadFile = File(...),
         row = SessionModel(id=session_id, date=session_id, full=session_id,
                            index_name=result["index_name"])
         db.add(row)
-    row.csv_data      = csv_text
-    row.csv_filename  = filename
-    row.gross_pnl     = result["gross_pnl"]
-    row.net_pnl       = result["net_pnl"]
-    row.ce_pnl        = result["ce_pnl"]
-    row.pe_pnl        = result["pe_pnl"]
-    row.charges       = result["total_charges"]
-    row.executed      = result["executed"]
-    row.rejected      = result["rejected"]
-    row.index_name    = result["index_name"]
-    row.strikes_json  = json.dumps(result["strikes"])
+    row.csv_data               = csv_text
+    row.csv_filename           = filename
+    row.gross_pnl              = result["gross_pnl"]
+    row.net_pnl                = result["net_pnl"]
+    row.ce_pnl                 = result["ce_pnl"]
+    row.pe_pnl                 = result["pe_pnl"]
+    row.charges                = result["total_charges"]
+    row.executed               = result["executed"]
+    row.rejected               = result["rejected"]
+    row.index_name             = result["index_name"]
+    row.strikes_json           = json.dumps(result["strikes"])
+    row.charges_breakdown_json = json.dumps(result["charges_breakdown"])
+    row.time_pnl_json          = json.dumps(result.get("time_pnl", {}))
     if row.capital and row.capital > 0:
         row.net_roi   = round(result["net_pnl"]   / row.capital * 100, 4)
         row.gross_roi = round(result["gross_pnl"] / row.capital * 100, 4)
@@ -181,14 +203,48 @@ def delete_chart(session_id: str, db: DBSession = Depends(get_db),
     db.commit()
     return {"message": "Chart deleted"}
 
-# ── AI COMMENTARY ──
+# ── JOURNAL MULTI-CHARTS ──
+@app.post("/journal-chart/{session_id}", tags=["Charts"])
+async def add_journal_chart(session_id: str, file: UploadFile = File(...),
+                            db: DBSession = Depends(get_db), user: dict = Depends(require_admin)):
+    img_bytes = await file.read()
+    if len(img_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large (max 10MB)")
+    b64  = base64.b64encode(img_bytes).decode("utf-8")
+    ext  = (file.filename or "chart.png").rsplit(".", 1)[-1].lower()
+    mime = f"image/{ext}" if ext in ("jpg","jpeg","png","webp","gif") else "image/png"
+    data_uri = f"data:{mime};base64,{b64}"
+    row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    charts = json.loads(row.journal_charts_json or "[]")
+    charts.append(data_uri)
+    row.journal_charts_json = json.dumps(charts)
+    db.commit()
+    return {"message": "Chart added", "count": len(charts)}
+
+@app.delete("/journal-chart/{session_id}/{chart_idx}", tags=["Charts"])
+def delete_journal_chart(session_id: str, chart_idx: int,
+                         db: DBSession = Depends(get_db), user: dict = Depends(require_admin)):
+    row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    charts = json.loads(row.journal_charts_json or "[]")
+    if chart_idx < 0 or chart_idx >= len(charts):
+        raise HTTPException(status_code=404, detail="Chart index out of range")
+    charts.pop(chart_idx)
+    row.journal_charts_json = json.dumps(charts)
+    db.commit()
+    return {"message": "Chart deleted", "count": len(charts)}
+
+# ── AI COMMENTARY (Grok / xAI) ──
 @app.post("/ai-commentary/{session_id}", tags=["AI"])
 async def generate_ai_commentary(session_id: str, db: DBSession = Depends(get_db),
                                   user: dict = Depends(require_admin)):
     import httpx
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("GROK_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+        raise HTTPException(status_code=503, detail="GROK_API_KEY not configured on server")
     row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -210,15 +266,15 @@ Journal: {row.journal or "Not provided"}
 Give sharp 3-paragraph commentary: (1) what the numbers say (2) one thing to fix (3) next session strike guidance."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 700,
+            "https://api.x.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json={"model": "grok-3-mini", "max_tokens": 700,
                   "messages": [{"role": "user", "content": prompt}]}
         )
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Claude API error: {resp.text}")
-    row.ai_commentary = resp.json()["content"][0]["text"]
+        raise HTTPException(status_code=502, detail=f"Grok API error: {resp.text}")
+    row.ai_commentary = resp.json()["choices"][0]["message"]["content"]
     db.commit()
     return {"session_id": session_id, "commentary": row.ai_commentary}
 
@@ -238,11 +294,14 @@ def _row_to_dict(r):
         "scores":      json.loads(r.scores_json or "{}"),
         "violations":  json.loads(r.violations_json or "[]"),
         "strengths":   json.loads(r.strengths_json or "[]"),
-        "ai_commentary": r.ai_commentary,
-        "csv_filename":  r.csv_filename,
-        "has_chart":     bool(r.chart_image),
-        "chart_image":   r.chart_image,
-        "strikes":       json.loads(r.strikes_json or "[]"),
+        "ai_commentary":      r.ai_commentary,
+        "csv_filename":       r.csv_filename,
+        "has_chart":          bool(r.chart_image),
+        "chart_image":        r.chart_image,
+        "strikes":            json.loads(r.strikes_json or "[]"),
+        "charges_breakdown":  json.loads(r.charges_breakdown_json or "{}"),
+        "time_pnl":           json.loads(r.time_pnl_json or "{}"),
+        "journal_charts":     json.loads(r.journal_charts_json or "[]"),
     }
 
 

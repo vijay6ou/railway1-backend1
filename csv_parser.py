@@ -7,6 +7,7 @@ import re
 import io
 from collections import defaultdict
 from charge_engine import compute_charges
+from datetime import datetime
 
 
 # ── Column name alias map ──────────────────────────────────────────
@@ -14,6 +15,9 @@ SYMBOL_COLS   = ['symbol','tradingsymbol','trading_symbol','scripname','scrip_na
                  'instrument','instrumentname','instrument_name','stock']
 SIDE_COLS     = ['side','transactiontype','transaction_type','buysell','buy/sell',
                  'type','order_type','ordertype','b/s','direction','buysell']
+TIME_COLS     = ['time','tradetime','trade_time','ordertime','order_time','timestamp',
+                 'executiontime','execution_time','tradeddatetime','traded_datetime',
+                 'exchangetime','exchange_time','tradedat','tradedtime']
 QTY_COLS      = ['tradeqty','trade_qty','qty','filledqty','filled_qty','quantity',
                  'tradedqty','traded_qty','executedqty','executed_qty','lotsize','lots',
                  'totalqty','total_qty','tradequantity']
@@ -62,6 +66,28 @@ def parse_symbol(symbol: str) -> dict:
     return {"index": s.split('2')[0] if '2' in s else s, "expiry": None, "strike": None, "option_type": None}
 
 
+def _parse_time(raw: str) -> str | None:
+    """Return HH:MM string from various broker time formats, or None."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Try common patterns
+    for fmt in ('%H:%M:%S', '%H:%M', '%d/%m/%Y %H:%M:%S', '%d-%m-%Y %H:%M:%S',
+                '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%d/%m/%Y %H:%M',
+                '%m/%d/%Y %H:%M:%S', '%d-%b-%Y %H:%M:%S'):
+        try:
+            return datetime.strptime(raw, fmt).strftime('%H:%M')
+        except ValueError:
+            continue
+    # Last-resort: grab HH:MM from anywhere in the string
+    m = re.search(r'(\d{2}):(\d{2})', raw)
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return f"{h:02d}:{mn:02d}"
+    return None
+
+
 def _detect_delimiter(text: str) -> str:
     sample = text[:3000]
     counts = {d: sample.count(d) for d in [',', '\t', ';', '|']}
@@ -104,6 +130,7 @@ def parse_orderbook_csv(csv_text: str) -> dict:
     total_buy_val  = 0.0
     total_sell_val = 0.0
     skipped = 0
+    timed_trades = []   # list of (time_str, symbol, side, qty, price)
 
     for row in rows:
         status_raw = _get(row, STATUS_COLS)
@@ -124,6 +151,7 @@ def parse_orderbook_csv(csv_text: str) -> dict:
         side_raw = (_get(row, SIDE_COLS) or '').upper().strip()
         qty_raw  = _get(row, QTY_COLS)
         px_raw   = _get(row, PRICE_COLS)
+        time_raw = _get(row, TIME_COLS)
 
         try:
             qty = float(str(qty_raw).replace(',', '').strip())
@@ -148,13 +176,18 @@ def parse_orderbook_csv(csv_text: str) -> dict:
 
         executed_count += 1
         value = qty * px
+        t = _parse_time(time_raw)
 
         if is_buy:
             fills[symbol]["buys"].append({"qty": qty, "price": px})
             total_buy_val += value
+            if t:
+                timed_trades.append((t, symbol, 'BUY', qty, px))
         else:
             fills[symbol]["sells"].append({"qty": qty, "price": px})
             total_sell_val += value
+            if t:
+                timed_trades.append((t, symbol, 'SELL', qty, px))
 
     if not fills:
         col_hint = f"Detected columns: {', '.join(sample_keys[:12])}"
@@ -215,6 +248,47 @@ def parse_orderbook_csv(csv_text: str) -> dict:
 
     strikes.sort(key=lambda x: x["realized"], reverse=True)
 
+    # ── Build intraday cumulative P&L curve from timed trades ──
+    time_pnl = {}
+    if timed_trades:
+        # Build per-symbol running book to compute realised P&L at each trade
+        running = defaultdict(lambda: {"buys": [], "sells": []})
+        timed_trades.sort(key=lambda x: x[0])
+        cum = 0.0
+        for t, sym, side, qty, px in timed_trades:
+            book = running[sym]
+            if side == 'BUY':
+                book["buys"].append({"qty": qty, "price": px})
+            else:
+                book["sells"].append({"qty": qty, "price": px})
+            bq = sum(f["qty"] for f in book["buys"])
+            sq = sum(f["qty"] for f in book["sells"])
+            bvwap = (sum(f["qty"]*f["price"] for f in book["buys"]) / bq) if bq else 0
+            svwap = (sum(f["qty"]*f["price"] for f in book["sells"]) / sq) if sq else 0
+            matched = min(bq, sq)
+            realized = round((svwap - bvwap) * matched, 2) if matched > 0 else 0.0
+            # Recalculate global cum from scratch is expensive; track per-sym realized delta
+            # Simple approach: recompute total realized across all symbols at this tick
+        # Recompute cleanly: for each timed trade, calculate full realised at that moment
+        running2 = defaultdict(lambda: {"buys": [], "sells": [], "last_realized": 0.0})
+        cum_total = 0.0
+        for t, sym, side, qty, px in timed_trades:
+            book = running2[sym]
+            if side == 'BUY':
+                book["buys"].append({"qty": qty, "price": px})
+            else:
+                book["sells"].append({"qty": qty, "price": px})
+            bq = sum(f["qty"] for f in book["buys"])
+            sq = sum(f["qty"] for f in book["sells"])
+            bvwap = (sum(f["qty"]*f["price"] for f in book["buys"]) / bq) if bq else 0
+            svwap = (sum(f["qty"]*f["price"] for f in book["sells"]) / sq) if sq else 0
+            matched = min(bq, sq)
+            new_realized = round((svwap - bvwap) * matched, 2) if matched > 0 else 0.0
+            delta = new_realized - book["last_realized"]
+            book["last_realized"] = new_realized
+            cum_total += delta
+            time_pnl[t] = round(cum_total, 2)
+
     return {
         "index_name":    index_name,
         "gross_pnl":     round(gross_pnl, 2),
@@ -230,5 +304,6 @@ def parse_orderbook_csv(csv_text: str) -> dict:
         "rejected":      rejected_count,
         "strikes":       strikes,
         "warnings":      warnings,
-        "carry_positions": [s for s in strikes if s["is_carry"]]
+        "carry_positions": [s for s in strikes if s["is_carry"]],
+        "time_pnl":      time_pnl,
     }
