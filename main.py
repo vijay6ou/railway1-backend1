@@ -20,6 +20,8 @@ Base.metadata.create_all(bind=engine)
 def _migrate():
     """Add new columns to existing sessions table without dropping data."""
     new_cols = [
+        ("journal",                "TEXT"),
+        ("strikes_json",           "TEXT DEFAULT '[]'"),
         ("charges_breakdown_json", "TEXT DEFAULT '{}'"),
         ("time_pnl_json",          "TEXT DEFAULT '{}'"),
         ("journal_charts_json",    "TEXT DEFAULT '[]'"),
