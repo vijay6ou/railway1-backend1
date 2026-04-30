@@ -770,7 +770,7 @@ function recompute() {
     else if (sym.endsWith('PE')) pePnl += pnl;
   }
 
-  const stt      = totalSV * 0.001;
+  const stt      = totalSV * 0.0015;
   const exchange = (totalBV+totalSV) * 0.00053;
   const sebi     = ((totalBV+totalSV)/1e7) * 10;
   const stamp    = totalBV * 0.00003;
@@ -888,6 +888,27 @@ function resetUpload() {
   renderView();
 }
 
+async function reuploadCSV(inp) {
+  const file = inp.files[0];
+  if (!file || !CUR) return;
+  const fd = new FormData();
+  fd.append('file', file, file.name);
+  try {
+    const res = await fetch(`/upload-csv/${CUR.id}`, {
+      method:'POST', headers:{'Authorization':`Bearer ${getToken()}`}, body:fd
+    });
+    if (!res.ok) {
+      const e = await res.json().catch(()=>({}));
+      toast(`CSV error: ${e.detail||res.status}`, 'err'); return;
+    }
+    const data = await res.json();
+    toast(`Parsed ${data.executed||0} trades, ${(data.strikes||[]).length} strikes`, 'ok');
+    await loadSessions();
+    CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
+    renderView();
+  } catch(e) { toast(e.message, 'err'); }
+}
+
 function loadSampleCSV() {
   const rows = [
     {Symbol:'NIFTY2641023300CE',Side:'SELL',Qty:'375',TradedPrice:'98',Status:'Executed'},
@@ -999,7 +1020,12 @@ function vStrikes() {
         <span style="font-size:12px;color:var(--tx2)">CE: <span class="fm ${(s.ce_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.ce_pnl||0)}</span></span>
         <span style="font-size:12px;color:var(--tx2)">PE: <span class="fm ${(s.pe_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.pe_pnl||0)}</span></span>
         <span style="font-size:12px;color:var(--tx2)">Gross: <span class="fm ${(s.gross_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.gross_pnl||0)}</span></span>
-      </div>` : '<div style="color:var(--tx3);font-size:12px">No strike data. Upload a CSV to parse individual strikes.</div>'}
+      </div>` : `<div style="display:flex;align-items:center;gap:14px;padding:8px 0">
+        <span style="color:var(--tx3);font-size:12px">No strike data for this session.</span>
+        ${USER_ROLE==='admin'?`<label class="btn btn-sm" style="cursor:pointer">
+          📂 Upload CSV<input type="file" accept=".csv" style="display:none" onchange="reuploadCSV(this)">
+        </label>`:''}
+      </div>`}
     </div>
     ${s.time_pnl&&Object.keys(s.time_pnl).length ? `
     <div class="card">
@@ -1062,7 +1088,7 @@ function vCharges() {
   const s = CUR, cb = s.charges_breakdown || {};
   const cr = s.gross_pnl>0 ? (s.charges/s.gross_pnl*100).toFixed(2) : 'N/A';
   const items = [
-    ['STT (0.1% on sell side)', cb.stt||0],
+    ['STT (0.15% on sell side)', cb.stt||0],
     ['NSE Exchange Fee (0.053% both sides)', cb.exchange||0],
     ['SEBI Fee (₹10 per Crore)', cb.sebi||0],
     ['Stamp Duty (0.003% on buy side)', cb.stamp||0],
@@ -1573,7 +1599,7 @@ function buildOverviewCharts() {
   if (eq) {
     const hasTP = s.time_pnl && Object.keys(s.time_pnl).length;
     // time_pnl values are already cumulative P&L — use directly (do NOT sum again)
-    const labels = hasTP ? Object.keys(s.time_pnl) : ['T1','T2','T3','T4','T5','Close'];
+    const labels = hasTP ? Object.keys(s.time_pnl) : ['T1','T2','T3','T4','T5'];
     const cum = hasTP
       ? [0, ...Object.values(s.time_pnl)]
       : [0, ...[0.2, 0.45, 0.7, 0.9, 1.0].map(f => Math.round((s.net_pnl||0)*f))];

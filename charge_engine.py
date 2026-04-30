@@ -20,8 +20,8 @@ def compute_charges(
     Returns:
         dict with individual charges and total
     """
-    # STT: 0.1% on sell side only (options sell)
-    stt = total_sell_value * 0.001
+    # STT: 0.15% on sell side only (options sell) — revised govt guideline
+    stt = total_sell_value * 0.0015
 
     # NSE Exchange Transaction Fee: 0.053% on total turnover
     exchange = total_turnover * 0.00053
