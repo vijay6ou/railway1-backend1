@@ -262,6 +262,17 @@ label{font-size:11px;color:var(--tx2);margin-bottom:4px;display:block;font-weigh
 .chg-leg-val{font-family:var(--fm);color:var(--tx)}
 .chg-leg-pct{color:var(--tx3);font-family:var(--fm);width:42px;text-align:right}
 @media(max-width:900px){.chg-grid-top{grid-template-columns:repeat(2,1fr)}.chg-grid-main{grid-template-columns:1fr}}
+
+/* ── WEEK-OVER-WEEK COMPARISON ── */
+.wow-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.wow-cell{padding:10px 0}
+.wow-cell-lbl{font-size:10px;color:var(--tx3);text-transform:uppercase;letter-spacing:.06em;font-weight:600;margin-bottom:6px}
+.wow-cell-val{font-family:var(--fm);font-size:16px;font-weight:600}
+.wow-cell-prev{font-size:11px;color:var(--tx3);font-family:var(--fm);margin-top:2px}
+.wow-cell-delta{font-size:11px;font-family:var(--fm);margin-top:4px;font-weight:500}
+.wow-cell-delta.pos{color:var(--gr)}
+.wow-cell-delta.neg{color:var(--rd)}
+@media(max-width:700px){.wow-grid{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
 <body>
@@ -964,11 +975,64 @@ function loadSampleCSV() {
 // ══════════════════════════════════════════════════════════════
 //  OVERVIEW VIEW
 // ══════════════════════════════════════════════════════════════
+function _isoWeek(dateStr) {
+  // Returns { year, week } for a YYYY-MM-DD date string
+  const d = new Date(dateStr + 'T00:00:00Z');
+  if (isNaN(d)) return null;
+  const target = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dayNr = (target.getUTCDay() + 6) % 7;
+  target.setUTCDate(target.getUTCDate() - dayNr + 3);
+  const firstThu = new Date(Date.UTC(target.getUTCFullYear(), 0, 4));
+  const week = 1 + Math.round(((target - firstThu) / 86400000 - 3 + ((firstThu.getUTCDay() + 6) % 7)) / 7);
+  return { year: target.getUTCFullYear(), week };
+}
+
+function _weekStats(sessions) {
+  if (!sessions.length) return { count:0, totalNet:0, totalGross:0, avgRoi:0, winRate:0 };
+  const totalNet   = sessions.reduce((a,s) => a + (s.net_pnl||0), 0);
+  const totalGross = sessions.reduce((a,s) => a + (s.gross_pnl||0), 0);
+  const avgRoi     = sessions.reduce((a,s) => a + (s.net_roi||0), 0) / sessions.length;
+  const winners    = sessions.filter(s => (s.net_pnl||0) > 0).length;
+  return {
+    count: sessions.length,
+    totalNet:   Math.round(totalNet),
+    totalGross: Math.round(totalGross),
+    avgRoi:     +avgRoi.toFixed(4),
+    winRate:    Math.round(winners / sessions.length * 100)
+  };
+}
+
+function _wowCompare(curId) {
+  const cur = _isoWeek(curId);
+  if (!cur) return null;
+  const prev = { year: cur.year, week: cur.week - 1 };
+  if (prev.week < 1) { prev.year -= 1; prev.week = 52; }
+  const inWeek = (sid, w) => {
+    const x = _isoWeek(sid);
+    return x && x.year === w.year && x.week === w.week;
+  };
+  return {
+    cur:  _weekStats(SESSIONS.filter(s => inWeek(s.id, cur))),
+    prev: _weekStats(SESSIONS.filter(s => inWeek(s.id, prev))),
+    curWeek: cur, prevWeek: prev
+  };
+}
+
+function _wowDelta(cur, prev, fmt) {
+  if (prev === 0 && cur === 0) return '<span style="color:var(--tx3)">—</span>';
+  if (prev === 0)              return `<span class="${cur>=0?'pos':'neg'}">new</span>`;
+  const d = cur - prev;
+  const pct = (d / Math.abs(prev) * 100);
+  const sign = d >= 0 ? '+' : '';
+  return `<span class="wow-cell-delta ${d>=0?'pos':'neg'}">${sign}${fmt?fmt(d):d.toFixed(2)} (${sign}${pct.toFixed(1)}%)</span>`;
+}
+
 function vOverview() {
   if (!CUR) return noSession();
   const s = CUR;
   const cr = s.gross_pnl>0 ? (s.charges/s.gross_pnl*100).toFixed(1) : 'N/A';
   const ceA=Math.abs(s.ce_pnl||0), peA=Math.abs(s.pe_pnl||0), tot=ceA+peA||1;
+  const wow = _wowCompare(s.id);
   return `
     <div class="grid4">
       <div class="mc"><div class="mc-lbl">Gross P&L</div>
@@ -984,6 +1048,41 @@ function vOverview() {
         <div class="mc-val" style="color:${(s.mt||0)>=7?'var(--rd)':(s.mt||0)>=5?'var(--am)':'var(--gr)'}">${s.mt||'—'}/10</div>
         <div class="mc-sub">VIX ${s.vix||'—'} · DTE ${s.dte}</div></div>
     </div>
+
+    ${wow && (wow.cur.count>0 || wow.prev.count>0) ? `
+    <div class="card">
+      <div class="card-title">Week-over-Week
+        <span class="card-badge">W${wow.curWeek.week} ${wow.cur.count}s · W${wow.prevWeek.week} ${wow.prev.count}s</span>
+      </div>
+      <div class="wow-grid">
+        <div class="wow-cell">
+          <div class="wow-cell-lbl">Sessions</div>
+          <div class="wow-cell-val">${wow.cur.count}</div>
+          <div class="wow-cell-prev">prev: ${wow.prev.count}</div>
+          <div>${_wowDelta(wow.cur.count, wow.prev.count)}</div>
+        </div>
+        <div class="wow-cell">
+          <div class="wow-cell-lbl">Net P&L</div>
+          <div class="wow-cell-val ${wow.cur.totalNet>=0?'pos':'neg'}">${fmtInr(wow.cur.totalNet)}</div>
+          <div class="wow-cell-prev">prev: ${fmtInr(wow.prev.totalNet)}</div>
+          <div>${_wowDelta(wow.cur.totalNet, wow.prev.totalNet, fmtInr)}</div>
+        </div>
+        <div class="wow-cell">
+          <div class="wow-cell-lbl">Avg ROI</div>
+          <div class="wow-cell-val ${wow.cur.avgRoi>=0?'pos':'neg'}">${wow.cur.avgRoi.toFixed(4)}%</div>
+          <div class="wow-cell-prev">prev: ${wow.prev.avgRoi.toFixed(4)}%</div>
+          <div>${_wowDelta(wow.cur.avgRoi, wow.prev.avgRoi, v => v.toFixed(4)+'%')}</div>
+        </div>
+        <div class="wow-cell">
+          <div class="wow-cell-lbl">Win Rate</div>
+          <div class="wow-cell-val">${wow.cur.winRate}%</div>
+          <div class="wow-cell-prev">prev: ${wow.prev.winRate}%</div>
+          <div>${_wowDelta(wow.cur.winRate, wow.prev.winRate, v => v.toFixed(0)+'pp')}</div>
+        </div>
+      </div>
+    </div>
+    ` : ''}
+
     <div class="grid2">
       <div class="card">
         <div class="card-title">Intraday P&L Curve
