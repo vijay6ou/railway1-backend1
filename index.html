@@ -273,6 +273,30 @@ label{font-size:11px;color:var(--tx2);margin-bottom:4px;display:block;font-weigh
 .wow-cell-delta.pos{color:var(--gr)}
 .wow-cell-delta.neg{color:var(--rd)}
 @media(max-width:700px){.wow-grid{grid-template-columns:repeat(2,1fr)}}
+
+/* ── CALENDAR HEATMAP ── */
+.cal-wrap{overflow-x:auto;padding:6px 0}
+.cal-svg{display:block;min-width:100%}
+.cal-cell{stroke:var(--bg);stroke-width:1px;cursor:pointer}
+.cal-cell.empty{fill:#eef0f4}
+.cal-cell:hover{stroke:var(--bl);stroke-width:1.5px}
+.cal-axis{font-family:var(--fm);font-size:9px;fill:var(--tx3)}
+.cal-tooltip{position:absolute;background:var(--s1);border:1px solid var(--bd);border-radius:6px;padding:6px 10px;font-size:11px;font-family:var(--fm);color:var(--tx);pointer-events:none;display:none;box-shadow:0 4px 12px rgba(0,0,0,.08);z-index:200}
+.cal-legend{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--tx3);font-family:var(--fm);margin-top:8px}
+.cal-legend-cell{width:12px;height:12px;border-radius:2px}
+
+/* ── SYMBOL LEADERBOARD ── */
+.sym-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.sym-list{display:flex;flex-direction:column;gap:4px}
+.sym-row{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;background:var(--s2);border-radius:5px;font-size:11px;font-family:var(--fm)}
+.sym-row-name{color:var(--tx);font-weight:500}
+.sym-row-meta{color:var(--tx3);font-size:10px}
+.sym-row-val{font-weight:600}
+@media(max-width:900px){.sym-grid{grid-template-columns:1fr}}
+
+/* ── DRAWDOWN STATS ── */
+.dd-stats{display:flex;gap:18px;flex-wrap:wrap;font-size:11px;color:var(--tx2);font-family:var(--fm);margin-bottom:8px}
+.dd-stats span b{color:var(--tx);font-weight:600}
 </style>
 </head>
 <body>
@@ -562,7 +586,11 @@ function afterRender() {
   if (CUR_VIEW === 'strikes')  buildStrikeCharts();
   if (CUR_VIEW === 'charges')  buildChargesChart();
   if (CUR_VIEW === 'scoring')  buildScoringCharts();
-  if (CUR_VIEW === 'trends')   { TREND_FROM = ''; TREND_TO = ''; buildTrendCharts(); }
+  if (CUR_VIEW === 'trends')   {
+    TREND_FROM = ''; TREND_TO = '';
+    buildTrendCharts();
+    buildCalendarHeatmap([...SESSIONS].sort((a,b)=>a.id.localeCompare(b.id)));
+  }
   if (CUR_VIEW === 'journal')  bindJournalEvents();
 }
 
@@ -1751,6 +1779,27 @@ function vTrends() {
       <div class="mc"><div class="mc-lbl">Worst Session</div><div class="mc-val neg">${(worst.net_roi||0).toFixed(3)}%</div><div class="mc-sub">${worst.date||worst.full}</div></div>
     </div>
 
+    <!-- ① CALENDAR HEATMAP -->
+    <div class="card">
+      <div class="card-title">Daily P&L Calendar
+        <span class="card-badge">last 12 months · GitHub-style</span>
+      </div>
+      <div class="cal-wrap" id="cal-wrap"></div>
+      <div class="cal-legend">
+        Less
+        <div class="cal-legend-cell" style="background:#eef0f4"></div>
+        <div class="cal-legend-cell" style="background:rgba(201,57,52,.6)"></div>
+        <div class="cal-legend-cell" style="background:rgba(201,57,52,.3)"></div>
+        <div class="cal-legend-cell" style="background:rgba(26,127,55,.3)"></div>
+        <div class="cal-legend-cell" style="background:rgba(26,127,55,.6)"></div>
+        <div class="cal-legend-cell" style="background:rgba(26,127,55,1)"></div>
+        More
+        <span style="margin-left:14px;color:var(--rd)">●</span> loss
+        <span style="margin-left:6px;color:var(--gr)">●</span> profit
+      </div>
+      <div class="cal-tooltip" id="cal-tooltip"></div>
+    </div>
+
     <!-- ② DAY-WISE P&L (stacked: net pnl + charges) -->
     <div class="card">
       <div class="card-title">Day-wise P&L
@@ -1767,8 +1816,15 @@ function vTrends() {
       <div class="chart-wrap"><canvas id="tr-eff-chart"></canvas></div>
     </div>
 
-    <!-- ④ CUMULATIVE NET P&L with date filter -->
+    <!-- ④ CUMULATIVE NET P&L with date filter + drawdown stats -->
     <div class="card">
+      ${(() => { const dd = _drawdownStats(sorted); return `
+      <div class="dd-stats">
+        <span>Peak Equity: <b class="pos">${fmtInr(dd.peak)}</b></span>
+        <span>Final Equity: <b class="${dd.final>=0?'pos':'neg'}">${fmtInr(dd.final)}</b></span>
+        <span>Max Drawdown: <b class="neg">−${fmtInr(Math.abs(dd.maxDD))} (${dd.maxDDPct.toFixed(2)}%)</b></span>
+        <span>Recovery: <b>${dd.recovered ? `${dd.recoveryDays} days` : 'not recovered'}</b></span>
+      </div>`; })()}
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">
         <div class="card-title" style="margin:0">Cumulative Net P&L</div>
         <div style="display:flex;gap:8px;align-items:center">
@@ -1793,7 +1849,192 @@ function vTrends() {
         <div class="card-title">DTE vs Avg Net ROI <span class="card-badge">grouped by days-to-expiry</span></div>
         <div class="chart-wrap"><canvas id="tr-dte-chart"></canvas></div>
       </div>
-    </div>`;
+    </div>
+
+    <!-- ⑦ SYMBOL / STRIKE LEADERBOARD -->
+    ${(() => {
+      const lb = _symbolLeaderboard(sorted);
+      if (!lb.mostTraded.length) return '';
+      const list = (rows, valFmt) => `<div class="sym-list">${rows.map(r => `
+        <div class="sym-row">
+          <div>
+            <div class="sym-row-name">${r.label}</div>
+            <div class="sym-row-meta">${r.meta}</div>
+          </div>
+          <div class="sym-row-val ${(r.colorVal??r.value)>=0?'pos':'neg'}">${valFmt(r.value)}</div>
+        </div>`).join('')}</div>`;
+      return `
+      <div class="card">
+        <div class="card-title">Strike Leaderboard
+          <span class="card-badge">aggregated across ${sorted.length} sessions</span>
+        </div>
+        <div class="sym-grid">
+          <div>
+            <div class="card-title" style="margin-bottom:8px;font-size:11px;color:var(--tx3)">Most Traded</div>
+            ${list(lb.mostTraded, v => v + ' trades')}
+          </div>
+          <div>
+            <div class="card-title" style="margin-bottom:8px;font-size:11px;color:var(--gr)">Best Performers</div>
+            ${list(lb.mostProfit, v => fmtInr(v))}
+          </div>
+          <div>
+            <div class="card-title" style="margin-bottom:8px;font-size:11px;color:var(--rd)">Worst Performers</div>
+            ${list(lb.mostLoss, v => fmtInr(v))}
+          </div>
+        </div>
+      </div>`;
+    })()}`;
+}
+
+// ── TRENDS HELPERS ──────────────────────────────────────────────
+function _drawdownStats(sorted) {
+  let peak = 0, cum = 0, maxDD = 0, maxDDIdx = -1;
+  let peakIdx = -1, troughIdx = -1, recoveryIdx = -1;
+  let curPeakIdx = -1;
+  sorted.forEach((s, i) => {
+    cum += (s.net_pnl || 0);
+    if (cum > peak) { peak = cum; curPeakIdx = i; }
+    const dd = cum - peak;
+    if (dd < maxDD) { maxDD = dd; maxDDIdx = i; peakIdx = curPeakIdx; }
+  });
+  // Find recovery: cumulative reaches old peak after trough
+  if (maxDDIdx >= 0) {
+    let c = 0;
+    for (let i = 0; i <= maxDDIdx; i++) c += (sorted[i].net_pnl || 0);
+    const peakValAtTrough = peak;
+    let runner = c;
+    for (let i = maxDDIdx + 1; i < sorted.length; i++) {
+      runner += (sorted[i].net_pnl || 0);
+      if (runner >= peakValAtTrough) { recoveryIdx = i; break; }
+    }
+  }
+  const final = sorted.reduce((a, s) => a + (s.net_pnl || 0), 0);
+  const maxDDPct = peak > 0 ? Math.abs(maxDD) / peak * 100 : 0;
+  let recoveryDays = 0;
+  if (recoveryIdx > 0 && peakIdx >= 0) {
+    const d1 = new Date(sorted[peakIdx].id);
+    const d2 = new Date(sorted[recoveryIdx].id);
+    if (!isNaN(d1) && !isNaN(d2)) recoveryDays = Math.round((d2 - d1) / 86400000);
+  }
+  return {
+    peak: Math.round(peak), final: Math.round(final),
+    maxDD: Math.round(maxDD), maxDDPct,
+    recovered: recoveryIdx > 0, recoveryDays
+  };
+}
+
+function _symbolLeaderboard(sorted) {
+  // Aggregate strikes across all sessions: { strikeKey: {trades, totalPnl, sessions} }
+  const agg = {};
+  sorted.forEach(s => {
+    (s.positions || []).forEach(p => {
+      const num = _strikeNum(p.sym);
+      const opt = (p.sym || '').toUpperCase().endsWith('CE') ? 'CE' : 'PE';
+      if (!num) return;
+      const key = `${num}${opt}`;
+      if (!agg[key]) agg[key] = { key, num, opt, trades: 0, totalPnl: 0, sessions: new Set() };
+      agg[key].trades += 1;
+      agg[key].totalPnl += (p.pnl || 0);
+      agg[key].sessions.add(s.id);
+    });
+  });
+  const arr = Object.values(agg).map(x => ({ ...x, sessionCount: x.sessions.size }));
+  if (!arr.length) return { mostTraded: [], mostProfit: [], mostLoss: [] };
+  const fmt = x => ({
+    label: `${x.num} ${x.opt}`,
+    meta: `${x.sessionCount} session${x.sessionCount>1?'s':''} · ${x.trades} trade${x.trades>1?'s':''}`,
+    value: x.totalPnl,
+    colorVal: x.totalPnl
+  });
+  return {
+    mostTraded: [...arr].sort((a,b) => b.trades - a.trades).slice(0, 5).map(x => ({
+      label: `${x.num} ${x.opt}`,
+      meta: `${x.sessionCount} session${x.sessionCount>1?'s':''} · ${fmtInr(x.totalPnl)} net`,
+      value: x.trades,
+      colorVal: x.totalPnl
+    })),
+    mostProfit: [...arr].filter(x => x.totalPnl > 0).sort((a,b) => b.totalPnl - a.totalPnl).slice(0, 5).map(fmt),
+    mostLoss:   [...arr].filter(x => x.totalPnl < 0).sort((a,b) => a.totalPnl - b.totalPnl).slice(0, 5).map(fmt)
+  };
+}
+
+function buildCalendarHeatmap(sorted) {
+  const wrap = document.getElementById('cal-wrap');
+  if (!wrap) return;
+  // Map session_id -> net_pnl
+  const byDay = {};
+  sorted.forEach(s => { byDay[s.id] = (byDay[s.id] || 0) + (s.net_pnl || 0); });
+  // Range: last 12 months ending today
+  const end = new Date();
+  end.setHours(0,0,0,0);
+  const start = new Date(end);
+  start.setMonth(start.getMonth() - 12);
+  // Snap start to Monday
+  const dayShift = (start.getDay() + 6) % 7;
+  start.setDate(start.getDate() - dayShift);
+
+  const CELL = 12, GAP = 2, ROW = CELL + GAP;
+  const days = [];
+  const cur = new Date(start);
+  while (cur <= end) { days.push(new Date(cur)); cur.setDate(cur.getDate() + 1); }
+  const weeks = Math.ceil(days.length / 7);
+  const W = weeks * ROW + 30;
+  const H = 7 * ROW + 24;
+
+  // Find max abs P&L for color scaling
+  const maxAbs = Math.max(...Object.values(byDay).map(Math.abs), 1);
+  const colorFor = pnl => {
+    if (pnl == null || pnl === 0) return '#eef0f4';
+    const intensity = Math.min(Math.abs(pnl) / maxAbs, 1);
+    const alpha = 0.18 + intensity * 0.82;
+    return pnl > 0 ? `rgba(26,127,55,${alpha})` : `rgba(201,57,52,${alpha})`;
+  };
+
+  const fmtDate = d => d.toISOString().slice(0,10);
+  let svgCells = '';
+  let monthLabels = '';
+  let lastMonth = -1;
+  days.forEach((d, idx) => {
+    const wk  = Math.floor(idx / 7);
+    const day = idx % 7;
+    const x = wk * ROW + 22;
+    const y = day * ROW + 18;
+    const dStr = fmtDate(d);
+    const pnl = byDay[dStr];
+    const future = d > end;
+    const fill = future ? 'transparent' : colorFor(pnl);
+    svgCells += `<rect class="cal-cell ${pnl==null?'empty':''}" x="${x}" y="${y}" width="${CELL}" height="${CELL}" rx="2" fill="${fill}" data-date="${dStr}" data-pnl="${pnl??''}"/>`;
+    if (day === 0 && d.getMonth() !== lastMonth) {
+      lastMonth = d.getMonth();
+      monthLabels += `<text class="cal-axis" x="${x}" y="14">${d.toLocaleString('en',{month:'short'})}</text>`;
+    }
+  });
+  const dayNames = ['Mon','Wed','Fri'];
+  let dayLabels = '';
+  dayNames.forEach((n, i) => {
+    dayLabels += `<text class="cal-axis" x="0" y="${(i*2)*ROW + 18 + 9}">${n}</text>`;
+  });
+
+  wrap.innerHTML = `<svg class="cal-svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+    ${monthLabels}${dayLabels}${svgCells}
+  </svg>`;
+
+  // Tooltip wiring
+  const tip = document.getElementById('cal-tooltip');
+  if (!tip) return;
+  wrap.querySelectorAll('rect.cal-cell').forEach(r => {
+    r.addEventListener('mouseenter', e => {
+      const d = r.getAttribute('data-date');
+      const p = r.getAttribute('data-pnl');
+      tip.innerHTML = p ? `<div>${d}</div><div class="${+p>=0?'pos':'neg'}">${fmtInr(+p)}</div>` : `<div>${d}</div><div style="color:var(--tx3)">no trade</div>`;
+      tip.style.display = 'block';
+    });
+    r.addEventListener('mousemove', e => {
+      tip.style.left = (e.pageX + 14) + 'px';
+      tip.style.top  = (e.pageY + 14) + 'px';
+    });
+    r.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+  });
 }
 
 // ══════════════════════════════════════════════════════════════
