@@ -985,7 +985,26 @@ function vOverview() {
         <div class="mc-sub">VIX ${s.vix||'—'} · DTE ${s.dte}</div></div>
     </div>
     <div class="grid2">
-      <div class="card"><div class="card-title">Intraday P&L Curve</div><div class="chart-wrap"><canvas id="eq-chart"></canvas></div></div>
+      <div class="card">
+        <div class="card-title">Intraday P&L Curve
+          ${(s.time_pnl&&Object.keys(s.time_pnl).length)?'<span class="card-badge">live from CSV</span>':'<span class="card-badge" style="background:var(--am2);color:var(--am)">no time data</span>'}
+        </div>
+        ${(s.time_pnl&&Object.keys(s.time_pnl).length) ? `
+          <div class="chart-wrap"><canvas id="eq-chart"></canvas></div>
+          <div style="display:flex;gap:18px;margin-top:8px;font-size:11px;color:var(--tx2);font-family:var(--fm);flex-wrap:wrap">
+            <span>HWM: <span class="pos">${fmtInr(_intradayStats(s).hwm)}</span></span>
+            <span>Max DD: <span class="neg">${fmtInr(_intradayStats(s).maxDD)}</span></span>
+            <span>Final: <span class="${(s.net_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.net_pnl||0)}</span></span>
+          </div>
+        ` : `<div style="padding:30px 0;text-align:center;color:var(--tx3)">
+          <div style="font-size:32px;margin-bottom:8px">⏱</div>
+          <div style="font-size:13px;color:var(--tx2);margin-bottom:6px">No intraday timestamps available</div>
+          <div style="font-size:11px">Re-upload your order book CSV (must contain a TradeTime / OrderTime column) to see the actual cumulative P&L curve.</div>
+          ${USER_ROLE==='admin'?`<label class="btn btn-sm" style="margin-top:14px;display:inline-block;cursor:pointer">
+            📂 Upload CSV<input type="file" accept=".csv" style="display:none" onchange="reuploadCSV(this)">
+          </label>`:''}
+        </div>`}
+      </div>
       <div class="card">
         <div class="card-title">CE vs PE Split</div>
         <div class="split-bar" style="height:10px;margin:12px 0 6px">
@@ -1876,18 +1895,60 @@ async function generateAI(id) {
 // ══════════════════════════════════════════════════════════════
 //  CHARTS
 // ══════════════════════════════════════════════════════════════
+function _intradayStats(s) {
+  const tp = s.time_pnl || {};
+  const vals = [0, ...Object.values(tp)];
+  let hwm = 0, maxDD = 0, peak = 0;
+  for (const v of vals) {
+    if (v > peak) peak = v;
+    if (v > hwm)  hwm  = v;
+    const dd = v - peak;
+    if (dd < maxDD) maxDD = dd;
+  }
+  return { hwm: Math.round(hwm), maxDD: Math.round(maxDD) };
+}
+
 function buildOverviewCharts() {
   const s = CUR; if (!s) return;
   const eq = document.getElementById('eq-chart');
   if (eq) {
-    const hasTP = s.time_pnl && Object.keys(s.time_pnl).length;
-    // time_pnl values are already cumulative P&L — use directly (do NOT sum again)
-    const labels = hasTP ? Object.keys(s.time_pnl) : ['T1','T2','T3','T4','T5'];
-    const cum = hasTP
-      ? [0, ...Object.values(s.time_pnl)]
-      : [0, ...[0.2, 0.45, 0.7, 0.9, 1.0].map(f => Math.round((s.net_pnl||0)*f))];
-    const pos = cum[cum.length-1] >= 0;
-    CHARTS.eq = new Chart(eq, {type:'line',data:{labels:['Open',...labels],datasets:[{data:cum,borderColor:pos?'#3fb950':'#f85149',backgroundColor:pos?'rgba(63,185,80,.06)':'rgba(248,81,73,.06)',fill:true,tension:.4,pointRadius:0,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#d0d7de'},ticks:{color:'#6b7280',font:{size:9}}},y:{grid:{color:'#d0d7de'},ticks:{color:'#6b7280',font:{size:9}}}}}});
+    const tp = s.time_pnl || {};
+    const tKeys = Object.keys(tp);
+    if (tKeys.length) {
+      // Real time-series — render proper chart with HWM line + drawdown shading
+      const labels = ['Open', ...tKeys];
+      const cum    = [0, ...Object.values(tp)];
+      // Compute running peak for drawdown visualisation
+      let peak = 0;
+      const peaks = cum.map(v => { if (v > peak) peak = v; return peak; });
+      const final = cum[cum.length - 1];
+      const lineColor = final >= 0 ? '#1a7f37' : '#c93934';
+      const fillColor = final >= 0 ? 'rgba(26,127,55,.08)' : 'rgba(201,57,52,.08)';
+      CHARTS.eq = new Chart(eq, {
+        type:'line',
+        data:{
+          labels,
+          datasets:[
+            { label:'P&L', data:cum, borderColor:lineColor, backgroundColor:fillColor,
+              fill:true, tension:.35, pointRadius:0, pointHoverRadius:4, borderWidth:2, order:2 },
+            { label:'High-water', data:peaks, borderColor:'rgba(154,103,0,.7)', borderDash:[5,4],
+              borderWidth:1.5, fill:false, pointRadius:0, tension:0, order:1 }
+          ]
+        },
+        options:{
+          responsive:true, maintainAspectRatio:false, interaction:{mode:'index',intersect:false},
+          plugins:{
+            legend:{display:true,position:'top',labels:{color:'#6b7280',boxWidth:12,font:{size:10}}},
+            tooltip:{callbacks:{label: ctx => `${ctx.dataset.label}: ${fmtInr(ctx.parsed.y)}`}}
+          },
+          scales:{
+            x:{grid:{color:'#d0d7de'},ticks:{color:'#6b7280',font:{size:9},maxRotation:0,autoSkipPadding:14}},
+            y:{grid:{color:'#d0d7de'},ticks:{color:'#6b7280',font:{size:9},callback:v=>fmtInr(v)}}
+          }
+        }
+      });
+    }
+    // else: vOverview already rendered the "no time data" empty-state, no chart to build
   }
   const cp = document.getElementById('cepe-chart');
   if (cp) {
