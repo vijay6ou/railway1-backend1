@@ -516,6 +516,11 @@ const VIEWS = ['upload','overview','strikes','scoring','charges','journal','sess
 
 function setView(v) {
   if (!VIEWS.includes(v)) return;
+  // Flush any pending journal save before navigating away
+  if (CUR_VIEW === 'journal' && _jrnSaveTimer) {
+    clearTimeout(_jrnSaveTimer); _jrnSaveTimer = null;
+    saveJournalNow(true);
+  }
   CUR_VIEW = v;
   VIEWS.forEach(n => {
     const el = document.getElementById('nav-'+n);
@@ -1372,11 +1377,15 @@ function vJournal() {
       ${galleryHtml}
 
       <!-- NOTES -->
-      <div class="card-title" style="margin-top:18px">Notes</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:18px;margin-bottom:6px">
+        <div class="card-title" style="margin:0">Notes</div>
+        <span id="jrn-save-status" style="font-size:11px;color:var(--tx3);font-family:var(--fm)"></span>
+      </div>
       ${isAdmin ? `
-        <textarea id="jrn-text" rows="10" placeholder="Pre-market plan, trade rationale, post-session observations, lessons learned…">${s.journal||''}</textarea>
+        <textarea id="jrn-text" rows="10" placeholder="Pre-market plan, trade rationale, post-session observations, lessons learned…&#10;&#10;Notes autosave 1 second after you stop typing." oninput="journalDirty()" onblur="saveJournalNow()">${s.journal||''}</textarea>
         <div class="btn-row" style="margin-top:10px">
-          <button class="btn btn-gr btn-sm" onclick="saveJournal()">💾 Save Notes</button>
+          <button class="btn btn-gr btn-sm" onclick="saveJournalNow()">💾 Save Now</button>
+          <span style="font-size:11px;color:var(--tx3);align-self:center">Auto-saves on pause &amp; blur</span>
         </div>
       ` : `<div style="white-space:pre-wrap;font-size:13px;line-height:1.8;color:var(--tx2);font-family:var(--fm)">${s.journal||'<span style="color:var(--tx3)">No journal entry</span>'}</div>`}
     </div>`;
@@ -1408,6 +1417,12 @@ function lbNav(dir) {
 
 let _jrnKeyBound = false;
 function bindJournalEvents() {
+  // Initialise save-status indicator each time the view is entered
+  if (CUR && CUR.journal) {
+    _jrnSetStatus(_jrnLastSavedAt ? `✓ saved ${_jrnFmtAge(_jrnLastSavedAt)}` : '✓ saved', 'var(--gr)');
+  } else {
+    _jrnSetStatus('');
+  }
   if (_jrnKeyBound) return;
   _jrnKeyBound = true;
   document.addEventListener('keydown', e => {
@@ -1416,18 +1431,75 @@ function bindJournalEvents() {
     if (e.key === 'ArrowLeft')   lbNav(-1);
     if (e.key === 'ArrowRight')  lbNav(1);
   });
+  // Flush on tab close / page refresh
+  window.addEventListener('beforeunload', () => {
+    if (CUR_VIEW === 'journal' && _jrnSaveTimer) {
+      clearTimeout(_jrnSaveTimer); _jrnSaveTimer = null;
+      saveJournalNow(true);
+    }
+  });
 }
 
-async function saveJournal() {
-  if (!CUR || USER_ROLE !== 'admin') return;
-  const journal = document.getElementById('jrn-text')?.value ?? '';
+// Autosave state
+let _jrnSaveTimer = null;
+let _jrnSaving = false;
+let _jrnLastSavedAt = null;
+const JRN_DEBOUNCE_MS = 1000;
+
+function _jrnSetStatus(msg, color) {
+  const el = document.getElementById('jrn-save-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = color || 'var(--tx3)';
+}
+
+function _jrnFmtAge(ts) {
+  if (!ts) return '';
+  const sec = Math.round((Date.now() - ts) / 1000);
+  if (sec < 5)  return 'just now';
+  if (sec < 60) return `${sec}s ago`;
+  const m = Math.floor(sec/60);
+  if (m < 60)   return `${m}m ago`;
+  return new Date(ts).toLocaleTimeString();
+}
+
+function journalDirty() {
+  _jrnSetStatus('● unsaved', 'var(--am)');
+  if (_jrnSaveTimer) clearTimeout(_jrnSaveTimer);
+  _jrnSaveTimer = setTimeout(() => saveJournalNow(true), JRN_DEBOUNCE_MS);
+}
+
+async function saveJournalNow(silent) {
+  if (!CUR || USER_ROLE !== 'admin' || _jrnSaving) return;
+  if (_jrnSaveTimer) { clearTimeout(_jrnSaveTimer); _jrnSaveTimer = null; }
+  const ta = document.getElementById('jrn-text');
+  if (!ta) return;
+  const journal = ta.value ?? '';
+  // Skip save if unchanged from last loaded
+  if ((CUR.journal||'') === journal && _jrnLastSavedAt) {
+    _jrnSetStatus(`✓ saved ${_jrnFmtAge(_jrnLastSavedAt)}`, 'var(--gr)');
+    return;
+  }
+  _jrnSaving = true;
+  _jrnSetStatus('saving…', 'var(--bl)');
   try {
     await saveSession({...CUR, journal});
-    await loadSessions();
-    CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
-    toast('Notes saved', 'ok');
-  } catch(e) { toast(e.message, 'err'); }
+    CUR.journal = journal;  // optimistic local update
+    _jrnLastSavedAt = Date.now();
+    _jrnSetStatus(`✓ saved just now`, 'var(--gr)');
+    if (!silent) toast('Notes saved', 'ok');
+    // refresh status indicator over time
+    setTimeout(() => { if (_jrnLastSavedAt) _jrnSetStatus(`✓ saved ${_jrnFmtAge(_jrnLastSavedAt)}`, 'var(--gr)'); }, 6000);
+  } catch(e) {
+    _jrnSetStatus('⚠ save failed', 'var(--rd)');
+    toast(e.message || 'Save failed', 'err');
+  } finally {
+    _jrnSaving = false;
+  }
 }
+
+// Backwards-compat alias (still referenced elsewhere)
+async function saveJournal() { return saveJournalNow(false); }
 
 async function addJournalChart(inp) {
   if (!CUR || !inp.files[0]) return;
