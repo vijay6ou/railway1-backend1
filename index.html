@@ -1372,15 +1372,24 @@ function vCharges() {
   const perTrade = (s.executed||0) > 0 ? (totalCharges/s.executed) : 0;
   const hasBd    = Object.values(cb).some(v => +v > 0);
 
+  // Round each item to 2 decimals so displayed sum == displayed total exactly
+  const r2 = v => Math.round((+v || 0) * 100) / 100;
   const items = [
-    ['STT',          cb.stt||0,       '0.15% on sell side',           '#c93934'],
-    ['Exchange',     cb.exchange||0,  '0.053% on turnover',           '#0969da'],
-    ['SEBI',         cb.sebi||0,      '₹10 per crore',           '#7048c0'],
-    ['Stamp Duty',   cb.stamp||0,     '0.003% on buy side',           '#9a6700'],
-    ['GST',          cb.gst||0,       '18% on Exchange + SEBI',       '#1a7f37'],
-    ['Brokerage',    cb.brokerage||0, 'Broker fee',                   '#6b7280'],
+    ['STT',          r2(cb.stt),       '0.15% on sell side',     '#c93934'],
+    ['Exchange',     r2(cb.exchange),  '0.053% on turnover',     '#0969da'],
+    ['SEBI',         r2(cb.sebi),      '₹10 per crore',          '#7048c0'],
+    ['Stamp Duty',   r2(cb.stamp),     '0.003% on buy side',     '#9a6700'],
+    ['GST',          r2(cb.gst),       '18% on Exchange + SEBI', '#1a7f37'],
+    ['Brokerage',    r2(cb.brokerage), 'Broker fee',             '#6b7280'],
   ];
-  const sumBd = items.reduce((a,[,v]) => a + (+v||0), 0) || 1;
+  // Sum of displayed (2-decimal) items — what the user can verify by adding the rows
+  const sumDisplayed = items.reduce((a,[,v]) => a + v, 0);
+  const sumBd        = sumDisplayed || 1;
+  // Reconciliation note if backend total differs from sum (rounding / brokerage mismatch)
+  const recon = Math.abs(totalCharges - sumDisplayed);
+  const reconNote = recon >= 0.5
+    ? `<div style="font-size:10px;color:var(--am);margin-top:4px">⚠ Backend stored ${fmtInr(totalCharges)} (${recon.toFixed(2)} difference vs sum — likely a rounding artefact)</div>`
+    : '';
 
   return `
     <div class="chg-grid-top">
@@ -1414,20 +1423,21 @@ function vCharges() {
         <div class="card-title">Breakdown <span class="card-badge">post-Budget 2024</span></div>
         <div class="chg-legend">
           ${items.map(([lbl,v,sub,col]) => {
-            const pct = (sumBd>0 ? (+v||0)/sumBd*100 : 0).toFixed(1);
+            const pct = (sumBd>0 ? v/sumBd*100 : 0).toFixed(1);
             return `<div class="chg-leg-row">
               <div class="chg-leg-dot" style="background:${col}"></div>
               <div class="chg-leg-lbl">${lbl} <span style="color:var(--tx3);font-size:10px">· ${sub}</span></div>
-              <div class="chg-leg-val">${fmtInr(Math.round(+v||0))}</div>
+              <div class="chg-leg-val">${fmtInr(v)}</div>
               <div class="chg-leg-pct">${pct}%</div>
             </div>`;
           }).join('')}
           <div class="chg-leg-row" style="border-top:1px solid var(--bd);margin-top:6px;padding-top:8px;font-weight:600">
             <div class="chg-leg-dot" style="background:transparent"></div>
-            <div class="chg-leg-lbl" style="color:var(--tx)">Total</div>
-            <div class="chg-leg-val" style="color:var(--rd)">${fmtInr(totalCharges)}</div>
+            <div class="chg-leg-lbl" style="color:var(--tx)">Sum of items</div>
+            <div class="chg-leg-val" style="color:var(--rd)">${fmtInr(sumDisplayed)}</div>
             <div class="chg-leg-pct">100%</div>
           </div>
+          ${reconNote}
         </div>
       </div>
     </div>
