@@ -243,6 +243,25 @@ label{font-size:11px;color:var(--tx2);margin-bottom:4px;display:block;font-weigh
 .strike-grid-charts{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
 .strike-chart-wrap{position:relative;height:280px;margin-top:8px}
 @media(max-width:900px){.strike-grid-top{grid-template-columns:repeat(2,1fr)}.strike-grid-charts{grid-template-columns:1fr}}
+
+/* ── CHARGES REVAMP ── */
+.chg-grid-top{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+.chg-stat{background:var(--s1);border:1px solid var(--bd);border-radius:8px;padding:14px}
+.chg-stat-lbl{font-size:10px;color:var(--tx3);text-transform:uppercase;letter-spacing:.06em;font-weight:600;margin-bottom:6px}
+.chg-stat-val{font-family:var(--fm);font-size:18px;font-weight:600}
+.chg-stat-sub{font-size:11px;color:var(--tx3);font-family:var(--fm);margin-top:4px}
+.chg-grid-main{display:grid;grid-template-columns:340px 1fr;gap:14px;margin-bottom:14px}
+.chg-pie-wrap{position:relative;height:280px;display:flex;align-items:center;justify-content:center}
+.chg-pie-center{position:absolute;text-align:center;pointer-events:none}
+.chg-pie-center-val{font-family:var(--fm);font-size:18px;font-weight:600;color:var(--rd)}
+.chg-pie-center-lbl{font-size:10px;color:var(--tx3);letter-spacing:.05em;text-transform:uppercase}
+.chg-legend{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.chg-leg-row{display:flex;align-items:center;gap:8px;font-size:11px}
+.chg-leg-dot{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.chg-leg-lbl{flex:1;color:var(--tx2);font-family:var(--fm)}
+.chg-leg-val{font-family:var(--fm);color:var(--tx)}
+.chg-leg-pct{color:var(--tx3);font-family:var(--fm);width:42px;text-align:right}
+@media(max-width:900px){.chg-grid-top{grid-template-columns:repeat(2,1fr)}.chg-grid-main{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -525,6 +544,7 @@ function afterRender() {
   updateTopbar();
   if (CUR_VIEW === 'overview') buildOverviewCharts();
   if (CUR_VIEW === 'strikes')  buildStrikeCharts();
+  if (CUR_VIEW === 'charges')  buildChargesChart();
   if (CUR_VIEW === 'scoring')  buildScoringCharts();
   if (CUR_VIEW === 'trends')   { TREND_FROM = ''; TREND_TO = ''; buildTrendCharts(); }
   if (CUR_VIEW === 'journal')  bindJournalEvents();
@@ -1191,30 +1211,116 @@ function vScoring() {
 function vCharges() {
   if (!CUR) return noSession();
   const s = CUR, cb = s.charges_breakdown || {};
-  const cr = s.gross_pnl>0 ? (s.charges/s.gross_pnl*100).toFixed(2) : 'N/A';
+  const totalCharges = s.charges || 0;
+  const gross    = s.gross_pnl || 0;
+  const net      = s.net_pnl || 0;
+  const grossRoi = s.gross_roi || 0;
+  const netRoi   = s.net_roi || 0;
+  const drag     = +(grossRoi - netRoi).toFixed(4);
+  const chgRatio = gross > 0 ? (totalCharges/gross*100).toFixed(2) : null;
+  const perTrade = (s.executed||0) > 0 ? (totalCharges/s.executed) : 0;
+  const hasBd    = Object.values(cb).some(v => +v > 0);
+
   const items = [
-    ['STT (0.15% on sell side)', cb.stt||0],
-    ['NSE Exchange Fee (0.053% both sides)', cb.exchange||0],
-    ['SEBI Fee (₹10 per Crore)', cb.sebi||0],
-    ['Stamp Duty (0.003% on buy side)', cb.stamp||0],
-    ['GST (18% on Exchange+SEBI)', cb.gst||0],
-    ['Brokerage', cb.brokerage||0],
+    ['STT',          cb.stt||0,       '0.15% on sell side',           '#c93934'],
+    ['Exchange',     cb.exchange||0,  '0.053% on turnover',           '#0969da'],
+    ['SEBI',         cb.sebi||0,      '₹10 per crore',           '#7048c0'],
+    ['Stamp Duty',   cb.stamp||0,     '0.003% on buy side',           '#9a6700'],
+    ['GST',          cb.gst||0,       '18% on Exchange + SEBI',       '#1a7f37'],
+    ['Brokerage',    cb.brokerage||0, 'Broker fee',                   '#6b7280'],
   ];
+  const sumBd = items.reduce((a,[,v]) => a + (+v||0), 0) || 1;
+
   return `
-    <div class="card">
-      <div class="card-title">Charges Breakdown — ${s.full} <span class="card-badge">post-Budget 2024</span></div>
-      ${items.map(([l,v])=>`<div class="chg-row"><div class="chg-lbl">${l}</div><div class="chg-val">${fmtInr(Math.round(v))}</div></div>`).join('')}
-      <div class="chg-row" style="border-top:1px solid var(--bd2);margin-top:4px;padding-top:10px">
-        <div class="chg-lbl" style="font-weight:600;color:var(--tx)">Total Charges</div>
-        <div class="chg-val" style="color:var(--rd)">${fmtInr(s.charges||0)}</div>
+    <div class="chg-grid-top">
+      <div class="chg-stat"><div class="chg-stat-lbl">Gross P&L</div>
+        <div class="chg-stat-val ${gross>=0?'pos':'neg'}">${fmtInr(gross)}</div>
+        <div class="chg-stat-sub">${grossRoi.toFixed(4)}% ROI</div></div>
+      <div class="chg-stat"><div class="chg-stat-lbl">Total Charges</div>
+        <div class="chg-stat-val neg">−${fmtInr(totalCharges)}</div>
+        <div class="chg-stat-sub">${chgRatio?chgRatio+'% of gross':'—'}</div></div>
+      <div class="chg-stat"><div class="chg-stat-lbl">Net P&L</div>
+        <div class="chg-stat-val ${net>=0?'pos':'neg'}">${fmtInr(net)}</div>
+        <div class="chg-stat-sub">${netRoi.toFixed(4)}% ROI</div></div>
+      <div class="chg-stat"><div class="chg-stat-lbl">ROI Drag</div>
+        <div class="chg-stat-val neg">−${drag.toFixed(4)}%</div>
+        <div class="chg-stat-sub">${perTrade>0?'₹'+perTrade.toFixed(2)+'/trade':'—'}</div></div>
+    </div>
+
+    ${hasBd ? `
+    <div class="chg-grid-main">
+      <div class="card">
+        <div class="card-title">Distribution</div>
+        <div class="chg-pie-wrap">
+          <canvas id="chg-pie-chart"></canvas>
+          <div class="chg-pie-center">
+            <div class="chg-pie-center-val">${fmtInr(totalCharges)}</div>
+            <div class="chg-pie-center-lbl">total cost</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Breakdown <span class="card-badge">post-Budget 2024</span></div>
+        <div class="chg-legend">
+          ${items.map(([lbl,v,sub,col]) => {
+            const pct = (sumBd>0 ? (+v||0)/sumBd*100 : 0).toFixed(1);
+            return `<div class="chg-leg-row">
+              <div class="chg-leg-dot" style="background:${col}"></div>
+              <div class="chg-leg-lbl">${lbl} <span style="color:var(--tx3);font-size:10px">· ${sub}</span></div>
+              <div class="chg-leg-val">${fmtInr(Math.round(+v||0))}</div>
+              <div class="chg-leg-pct">${pct}%</div>
+            </div>`;
+          }).join('')}
+          <div class="chg-leg-row" style="border-top:1px solid var(--bd);margin-top:6px;padding-top:8px;font-weight:600">
+            <div class="chg-leg-dot" style="background:transparent"></div>
+            <div class="chg-leg-lbl" style="color:var(--tx)">Total</div>
+            <div class="chg-leg-val" style="color:var(--rd)">${fmtInr(totalCharges)}</div>
+            <div class="chg-leg-pct">100%</div>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="grid3">
-      <div class="mc"><div class="mc-lbl">Gross P&L</div><div class="mc-val ${(s.gross_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.gross_pnl||0)}</div></div>
-      <div class="mc"><div class="mc-lbl">Total Charges</div><div class="mc-val neg">−${fmtInr(s.charges||0)}</div></div>
-      <div class="mc"><div class="mc-lbl">Net P&L</div><div class="mc-val ${(s.net_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.net_pnl||0)}</div>
-        <div class="mc-sub">Charge ratio: ${cr}% of gross</div></div>
-    </div>`;
+    ` : `
+    <div class="card">
+      <div class="card-title">Charges Breakdown</div>
+      <div style="display:flex;align-items:center;gap:14px;padding:14px 0">
+        <span style="color:var(--tx3);font-size:13px">No detailed breakdown available for this session (only total: ${fmtInr(totalCharges)}).</span>
+        ${USER_ROLE==='admin'?`<label class="btn btn-sm" style="cursor:pointer">
+          📂 Upload CSV<input type="file" accept=".csv" style="display:none" onchange="reuploadCSV(this)">
+        </label>`:''}
+      </div>
+    </div>
+    `}`;
+}
+
+function buildChargesChart() {
+  const s = CUR; if (!s) return;
+  const cb = s.charges_breakdown || {};
+  const el = document.getElementById('chg-pie-chart');
+  if (!el) return;
+  const items = [
+    ['STT',        cb.stt||0,       '#c93934'],
+    ['Exchange',   cb.exchange||0,  '#0969da'],
+    ['SEBI',       cb.sebi||0,      '#7048c0'],
+    ['Stamp Duty', cb.stamp||0,     '#9a6700'],
+    ['GST',        cb.gst||0,       '#1a7f37'],
+    ['Brokerage',  cb.brokerage||0, '#6b7280'],
+  ].filter(([,v]) => +v > 0);
+  if (!items.length) return;
+  CHARTS.chgPie = new Chart(el, {
+    type:'doughnut',
+    data:{
+      labels: items.map(x => x[0]),
+      datasets:[{ data: items.map(x => +x[1]), backgroundColor: items.map(x => x[2]), borderWidth:0 }]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false, cutout:'68%',
+      plugins:{
+        legend:{display:false},
+        tooltip:{callbacks:{label: ctx => `${ctx.label}: ${fmtInr(ctx.parsed)}`}}
+      }
+    }
+  });
 }
 
 // ══════════════════════════════════════════════════════════════
