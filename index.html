@@ -229,6 +229,20 @@ label{font-size:11px;color:var(--tx2);margin-bottom:4px;display:block;font-weigh
 .jrn-chart-card:hover{border-color:var(--bl)}
 .jrn-chart-card img{width:100%;height:280px;object-fit:contain;display:block;cursor:zoom-in;background:var(--s3)}
 .jrn-chart-footer{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;border-top:1px solid var(--bd);background:var(--s1)}
+
+/* ── STRIKE-WISE PnL REVAMP ── */
+.strike-grid-top{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+.strike-stat{background:var(--s1);border:1px solid var(--bd);border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:4px}
+.strike-stat.gr{border-left:3px solid var(--gr)}
+.strike-stat.rd{border-left:3px solid var(--rd)}
+.strike-stat-lbl{font-size:10px;color:var(--tx3);text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+.strike-stat-sym{font-family:var(--fm);font-size:12px;color:var(--tx2);margin-top:6px}
+.strike-stat-pnl{font-family:var(--fm);font-size:18px;font-weight:600;margin-top:4px}
+.strike-stat-meta{font-size:11px;color:var(--tx3);font-family:var(--fm);margin-top:2px}
+.strike-stat-empty{font-size:13px;color:var(--tx3);padding:10px 0;font-family:var(--fm)}
+.strike-grid-charts{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.strike-chart-wrap{position:relative;height:280px;margin-top:8px}
+@media(max-width:900px){.strike-grid-top{grid-template-columns:repeat(2,1fr)}.strike-grid-charts{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -510,6 +524,7 @@ function destroyCharts() {
 function afterRender() {
   updateTopbar();
   if (CUR_VIEW === 'overview') buildOverviewCharts();
+  if (CUR_VIEW === 'strikes')  buildStrikeCharts();
   if (CUR_VIEW === 'scoring')  buildScoringCharts();
   if (CUR_VIEW === 'trends')   { TREND_FROM = ''; TREND_TO = ''; buildTrendCharts(); }
   if (CUR_VIEW === 'journal')  bindJournalEvents();
@@ -993,20 +1008,74 @@ function renderPeerBars(s) {
 // ══════════════════════════════════════════════════════════════
 //  STRIKE P&L VIEW
 // ══════════════════════════════════════════════════════════════
+function _strikeNum(sym) {
+  const m = (sym||'').match(/(\d{4,6})(?:CE|PE)$/i);
+  return m ? parseInt(m[1]) : 0;
+}
+
 function vStrikes() {
   if (!CUR) return noSession();
   const s = CUR;
   const pos = s.positions || [];
+
+  if (!pos.length) {
+    return `<div class="card">
+      <div class="card-title">Strike-wise P&L — ${s.full}</div>
+      <div style="display:flex;align-items:center;gap:14px;padding:14px 0">
+        <span style="color:var(--tx3);font-size:13px">No strike data for this session.</span>
+        ${USER_ROLE==='admin'?`<label class="btn btn-sm" style="cursor:pointer">
+          📂 Upload CSV<input type="file" accept=".csv" style="display:none" onchange="reuploadCSV(this)">
+        </label>`:''}
+      </div>
+    </div>`;
+  }
+
+  const ce = pos.filter(p => (p.sym||'').toUpperCase().endsWith('CE'));
+  const pe = pos.filter(p => (p.sym||'').toUpperCase().endsWith('PE'));
+  const bestOf  = list => list.length ? list.reduce((a,b) => (a.pnl||0) >= (b.pnl||0) ? a : b) : null;
+  const worstOf = list => list.length ? list.reduce((a,b) => (a.pnl||0) <= (b.pnl||0) ? a : b) : null;
+
+  const card = (lbl, p, color) => `
+    <div class="strike-stat ${color}">
+      <div class="strike-stat-lbl">${lbl}</div>
+      ${p ? `
+        <div class="strike-stat-sym">${_strikeNum(p.sym)||'—'} ${(p.sym||'').toUpperCase().endsWith('CE')?'CE':'PE'}</div>
+        <div class="strike-stat-pnl ${(p.pnl||0)>=0?'pos':'neg'}">${fmtInr(p.pnl||0)}</div>
+        <div class="strike-stat-meta">Qty ${p.qty||0} · ${p.side||'—'}${p.open?' · ⚠ OPEN':''}</div>
+      ` : '<div class="strike-stat-empty">— no trades —</div>'}
+    </div>`;
+
   return `
+    <div class="strike-grid-top">
+      ${card('Best CE',  bestOf(ce),  'gr')}
+      ${card('Worst CE', worstOf(ce), 'rd')}
+      ${card('Best PE',  bestOf(pe),  'gr')}
+      ${card('Worst PE', worstOf(pe), 'rd')}
+    </div>
+
+    <div class="strike-grid-charts">
+      <div class="card">
+        <div class="card-title">CE Strikes <span class="card-badge">${ce.length}</span> · Net <span class="${(s.ce_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.ce_pnl||0)}</span></div>
+        <div class="strike-chart-wrap">
+          ${ce.length ? '<canvas id="strike-ce-chart"></canvas>' : '<div style="color:var(--tx3);font-size:12px;padding:20px">No CE trades</div>'}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">PE Strikes <span class="card-badge">${pe.length}</span> · Net <span class="${(s.pe_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.pe_pnl||0)}</span></div>
+        <div class="strike-chart-wrap">
+          ${pe.length ? '<canvas id="strike-pe-chart"></canvas>' : '<div style="color:var(--tx3);font-size:12px;padding:20px">No PE trades</div>'}
+        </div>
+      </div>
+    </div>
+
     <div class="card">
-      <div class="card-title">Strike-wise P&L — ${s.full} <span class="card-badge">${pos.length} strikes</span></div>
-      ${pos.length ? `
+      <div class="card-title">All Strikes — Detail <span class="card-badge">${pos.length}</span></div>
       <table class="tbl">
         <thead><tr><th>Symbol</th><th>Type</th><th>Side</th><th>Sell Avg</th><th>Buy Avg</th><th>Qty</th><th>P&L</th><th>Status</th></tr></thead>
         <tbody>
-          ${pos.map(p=>`<tr>
+          ${[...pos].sort((a,b)=>(b.pnl||0)-(a.pnl||0)).map(p=>`<tr>
             <td class="fm" style="font-size:11px">${p.sym||p.strike||'—'}</td>
-            <td><span class="badge ${(p.sym||'').endsWith('CE')?'b-rd':'b-gr'}">${(p.sym||'').endsWith('CE')?'CE':'PE'}</span></td>
+            <td><span class="badge ${(p.sym||'').toUpperCase().endsWith('CE')?'b-rd':'b-gr'}">${(p.sym||'').toUpperCase().endsWith('CE')?'CE':'PE'}</span></td>
             <td><span class="badge ${p.side==='SHORT'?'b-rd':'b-gr'}">${p.side||'—'}</span></td>
             <td class="fm">${p.sell_vwap>0?'₹'+(+p.sell_vwap).toFixed(2):'—'}</td>
             <td class="fm">${p.buy_vwap>0?'₹'+(+p.buy_vwap).toFixed(2):'—'}</td>
@@ -1020,23 +1089,59 @@ function vStrikes() {
         <span style="font-size:12px;color:var(--tx2)">CE: <span class="fm ${(s.ce_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.ce_pnl||0)}</span></span>
         <span style="font-size:12px;color:var(--tx2)">PE: <span class="fm ${(s.pe_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.pe_pnl||0)}</span></span>
         <span style="font-size:12px;color:var(--tx2)">Gross: <span class="fm ${(s.gross_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.gross_pnl||0)}</span></span>
-      </div>` : `<div style="display:flex;align-items:center;gap:14px;padding:8px 0">
-        <span style="color:var(--tx3);font-size:12px">No strike data for this session.</span>
-        ${USER_ROLE==='admin'?`<label class="btn btn-sm" style="cursor:pointer">
-          📂 Upload CSV<input type="file" accept=".csv" style="display:none" onchange="reuploadCSV(this)">
-        </label>`:''}
-      </div>`}
+      </div>
     </div>
+
     ${s.time_pnl&&Object.keys(s.time_pnl).length ? `
     <div class="card">
-      <div class="card-title">Time-of-Day P&L</div>
+      <div class="card-title">Time-of-Day Cumulative P&L</div>
       ${Object.entries(s.time_pnl).map(([t,v])=>{
         const maxV=Math.max(...Object.values(s.time_pnl).map(Math.abs),1);
         const pct=Math.abs(v)/maxV*100;
-        const bg=v>0?`rgba(63,185,80,${.1+pct*.007})`:`rgba(248,81,73,${.1+pct*.007})`;
+        const bg=v>0?`rgba(26,127,55,${.08+pct*.007})`:`rgba(201,57,52,${.08+pct*.007})`;
         return `<div class="hm-row"><div class="hm-lbl">${t}</div><div class="hm-bar" style="background:${bg}"><span class="hm-val ${v>=0?'pos':'neg'}">${fmtInr(v)}</span></div></div>`;
       }).join('')}
     </div>` : ''}`;
+}
+
+function buildStrikeCharts() {
+  const s = CUR; if (!s) return;
+  const pos = s.positions || []; if (!pos.length) return;
+
+  const ce = pos.filter(p => (p.sym||'').toUpperCase().endsWith('CE'))
+                .sort((a,b) => _strikeNum(a.sym) - _strikeNum(b.sym));
+  const pe = pos.filter(p => (p.sym||'').toUpperCase().endsWith('PE'))
+                .sort((a,b) => _strikeNum(a.sym) - _strikeNum(b.sym));
+
+  const buildSide = (canvasId, list, sideKey) => {
+    const el = document.getElementById(canvasId);
+    if (!el || !list.length) return null;
+    const labels = list.map(p => String(_strikeNum(p.sym)));
+    const data   = list.map(p => p.pnl || 0);
+    const colors = data.map(v => v>=0 ? 'rgba(26,127,55,.78)' : 'rgba(201,57,52,.78)');
+    return new Chart(el, {
+      type:'bar',
+      data:{ labels, datasets:[{ data, backgroundColor:colors, borderRadius:3, barThickness:'flex', maxBarThickness:28 }] },
+      options:{
+        indexAxis:'y',
+        responsive:true, maintainAspectRatio:false,
+        plugins:{
+          legend:{display:false},
+          tooltip:{callbacks:{
+            title: ctx => list[ctx[0].dataIndex].sym || '',
+            label: ctx => `P&L: ${fmtInr(ctx.parsed.x)} · Qty ${list[ctx.dataIndex].qty||0} · ${list[ctx.dataIndex].side||'—'}`
+          }}
+        },
+        scales:{
+          x:{grid:{color:'#d0d7de'},ticks:{color:'#6b7280',font:{size:9},callback:v=>fmtInr(v)}},
+          y:{grid:{display:false},ticks:{color:'#6b7280',font:{size:10,family:"'JetBrains Mono'"}}}
+        }
+      }
+    });
+  };
+
+  CHARTS.strikeCe = buildSide('strike-ce-chart', ce, 'ce');
+  CHARTS.strikePe = buildSide('strike-pe-chart', pe, 'pe');
 }
 
 // ══════════════════════════════════════════════════════════════
