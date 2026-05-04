@@ -10,21 +10,52 @@ from charge_engine import compute_charges
 from datetime import datetime
 
 
-# ── Column name alias map ──────────────────────────────────────────
-SYMBOL_COLS   = ['symbol','tradingsymbol','trading_symbol','scripname','scrip_name',
-                 'instrument','instrumentname','instrument_name','stock']
-SIDE_COLS     = ['side','transactiontype','transaction_type','buysell','buy/sell',
-                 'type','order_type','ordertype','b/s','direction','buysell']
+# ── Column name alias map (covers Zerodha, Upstox, Angel, Fyers, IIFL, 5paisa, STOXXO/Jainam) ──
+SYMBOL_COLS   = ['symbol','tradingsymbol','trading_symbol','scripname','scrip_name','scrip',
+                 'instrument','instrumentname','instrument_name','stock','contractname','contract']
+SIDE_COLS     = ['side','transactiontype','transaction_type','buysell','buy/sell','buy_sell',
+                 'type','order_type','ordertype','b/s','direction','tradetype','trade_type',
+                 'orderside','txnside']
 TIME_COLS     = ['time','tradetime','trade_time','ordertime','order_time','timestamp',
                  'executiontime','execution_time','tradeddatetime','traded_datetime',
-                 'exchangetime','exchange_time','tradedat','tradedtime']
+                 'exchangetime','exchange_time','tradedat','tradedtime',
+                 'orderexecutiontime','order_execution_time','exchange_order_time',
+                 'exchordertime','fill_time','filltime']
+DATE_COLS     = ['tradedate','trade_date','date','orderdate','order_date','executiondate']
 QTY_COLS      = ['tradeqty','trade_qty','qty','filledqty','filled_qty','quantity',
                  'tradedqty','traded_qty','executedqty','executed_qty','lotsize','lots',
-                 'totalqty','total_qty','tradequantity']
+                 'totalqty','total_qty','tradequantity','filledquantity','executedquantity']
 PRICE_COLS    = ['tradeprice','trade_price','price','averageprice','average_price',
                  'avg_price','avgprice','executedprice','executed_price','tradedprice',
-                 'traded_price','lastprice','last_price','fillprice','fill_price','rate']
-STATUS_COLS   = ['status','orderstatus','order_status','state','orderstate']
+                 'traded_price','lastprice','last_price','fillprice','fill_price','rate',
+                 'avgexecutionprice','execution_price','avgtradeprice']
+STATUS_COLS   = ['status','orderstatus','order_status','state','orderstate','ordstatus','exchange_status']
+
+# ── Broker format presets (for autodetection display) ──
+BROKER_FORMATS = [
+    ('Zerodha (Kite/Console)',  ['tradingsymbol','trade_price','order_execution_time']),
+    ('Upstox',                  ['scrip','trade_type','traded_price','trade_date']),
+    ('Angel One',               ['symbol','transactiontype','tradedquantity','averageprice']),
+    ('Fyers',                   ['symbol','side','qty','tradeprice','tradetime']),
+    ('IIFL Securities',         ['scripname','transactiontype','quantity','price']),
+    ('5paisa',                  ['scripname','buysell','qty','price','ordstatus']),
+    ('STOXXO / Jainam',         ['symbol','side','tradeqty','tradeprice']),
+]
+
+def detect_broker(headers):
+    """Identify broker from CSV headers via exact column match (after normalisation)."""
+    norm = set(re.sub(r'[\s_\-\.]+','',h.strip().lower()) for h in headers)
+    best, best_ratio, best_score = 'Generic', 0.0, 0
+    for name, signals in BROKER_FORMATS:
+        sigs = [re.sub(r'[\s_\-\.]+','',s) for s in signals]
+        score = sum(1 for s in sigs if s in norm)
+        if score < max(2, len(sigs) * 0.6):
+            continue
+        ratio = score / len(sigs)
+        # Prefer higher absolute score (more specific format), then higher coverage ratio
+        if score > best_score or (score == best_score and ratio > best_ratio):
+            best, best_score, best_ratio = name, score, ratio
+    return best
 
 def _get(row, cols):
     for c in cols:
@@ -66,17 +97,23 @@ def parse_symbol(symbol: str) -> dict:
     return {"index": s.split('2')[0] if '2' in s else s, "expiry": None, "strike": None, "option_type": None}
 
 
-def _parse_time(raw: str) -> str | None:
+def _parse_time(raw):
     """Return HH:MM string from various broker time formats, or None."""
     if not raw:
         return None
-    raw = raw.strip()
-    # Try common patterns
+    raw = str(raw).strip()
+    # Try common patterns (covers Zerodha, Upstox, Angel, Fyers, IIFL, 5paisa)
     for fmt in ('%H:%M:%S', '%H:%M', '%d/%m/%Y %H:%M:%S', '%d-%m-%Y %H:%M:%S',
                 '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%d/%m/%Y %H:%M',
-                '%m/%d/%Y %H:%M:%S', '%d-%b-%Y %H:%M:%S'):
+                '%m/%d/%Y %H:%M:%S', '%d-%b-%Y %H:%M:%S', '%Y-%m-%d %H:%M',
+                '%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d-%b-%Y',
+                '%Y-%m-%dT%H:%M:%S.%f', '%d-%b-%Y %H:%M'):
         try:
-            return datetime.strptime(raw, fmt).strftime('%H:%M')
+            dt = datetime.strptime(raw, fmt)
+            # Date-only formats → return market open as proxy so curve still renders chronologically
+            if dt.hour == 0 and dt.minute == 0 and ':' not in raw and 'T' not in raw:
+                return None  # no intraday signal — caller will skip time tracking
+            return dt.strftime('%H:%M')
         except ValueError:
             continue
     # Last-resort: grab HH:MM from anywhere in the string
@@ -123,6 +160,9 @@ def parse_orderbook_csv(csv_text: str) -> dict:
 
     # Diagnose columns for debugging
     sample_keys = list(rows[0].keys()) if rows else []
+    # Detect broker from RAW headers (before normalisation) so signal columns match
+    raw_first_row = next(csv.DictReader(io.StringIO(csv_text), delimiter=delim), {})
+    broker = detect_broker(list(raw_first_row.keys())) if raw_first_row else 'Generic'
 
     fills = defaultdict(lambda: {"buys": [], "sells": []})
     executed_count = 0
@@ -291,6 +331,7 @@ def parse_orderbook_csv(csv_text: str) -> dict:
 
     return {
         "index_name":    index_name,
+        "broker":        broker,
         "gross_pnl":     round(gross_pnl, 2),
         "net_pnl":       round(net_pnl, 2),
         "ce_pnl":        round(total_ce_pnl, 2),

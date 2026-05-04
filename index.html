@@ -1316,7 +1316,7 @@ async function reuploadCSV(inp) {
       toast(`CSV error: ${e.detail||res.status}`, 'err'); return;
     }
     const data = await res.json();
-    toast(`Parsed ${data.executed||0} trades, ${(data.strikes||[]).length} strikes`, 'ok');
+    toast(`[${data.broker||'Generic'}] Parsed ${data.executed||0} trades, ${(data.strikes||[]).length} strikes`, 'ok');
     await loadSessions();
     CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
     renderView();

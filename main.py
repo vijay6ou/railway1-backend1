@@ -179,7 +179,8 @@ async def upload_csv(session_id: str, file: UploadFile = File(...),
         "total_charges": result["total_charges"], "executed": result["executed"],
         "rejected": result["rejected"], "strikes": result["strikes"],
         "carry_positions": result["carry_positions"], "warnings": result["warnings"],
-        "message": f"Parsed {result['executed']} orders, {len(result['strikes'])} strikes"
+        "broker":  result.get("broker", "Generic"),
+        "message": f"[{result.get('broker','Generic')}] Parsed {result['executed']} orders, {len(result['strikes'])} strikes"
     }
 
 # ── CHART UPLOAD ──
