@@ -1,8 +1,28 @@
 """
 VJ Trading Dashboard — SQLAlchemy ORM Models
 """
-from sqlalchemy import Column, String, Float, Integer, Text
+from sqlalchemy import Column, String, Float, Integer, Text, DateTime
+from datetime import datetime
 from database import Base
+
+
+class OpenPosition(Base):
+    """
+    Persists open option positions across sessions so the next upload
+    can match closing trades against the actual carry-in entry price
+    (not treat the close as a fresh single-sided trade).
+    """
+    __tablename__ = "open_positions"
+    symbol          = Column(String, primary_key=True)
+    side            = Column(String)               # 'SHORT' or 'LONG'
+    qty             = Column(Float)                # absolute open qty
+    avg_price       = Column(Float)                # carry-in vwap
+    expiry          = Column(String, nullable=True) # DD/MM/YYYY string from parse_symbol
+    strike          = Column(Integer, nullable=True)
+    option_type     = Column(String, nullable=True)
+    index_name      = Column(String, nullable=True)
+    last_session_id = Column(String, nullable=True)
+    updated_at      = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Session(Base):
@@ -39,4 +59,6 @@ class Session(Base):
     strikes_json           = Column(Text, default="[]")
     charges_breakdown_json = Column(Text, default="{}")
     time_pnl_json          = Column(Text, default="{}")
+    margin_ts_json         = Column(Text, default="{}")
     journal_charts_json    = Column(Text, default="[]")
+    peak_margin            = Column(Float, nullable=True)

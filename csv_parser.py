@@ -105,27 +105,65 @@ def _parse_time(raw):
     if not raw:
         return None
     raw = str(raw).strip()
-    # Try common patterns (covers Zerodha, Upstox, Angel, Fyers, IIFL, 5paisa)
+    # Try common patterns (covers Zerodha, Upstox, Angel, Fyers, IIFL, 5paisa, STOXXO)
     for fmt in ('%H:%M:%S', '%H:%M', '%d/%m/%Y %H:%M:%S', '%d-%m-%Y %H:%M:%S',
                 '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%d/%m/%Y %H:%M',
                 '%m/%d/%Y %H:%M:%S', '%d-%b-%Y %H:%M:%S', '%Y-%m-%d %H:%M',
                 '%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d-%b-%Y',
-                '%Y-%m-%dT%H:%M:%S.%f', '%d-%b-%Y %H:%M'):
+                '%Y-%m-%dT%H:%M:%S.%f', '%d-%b-%Y %H:%M',
+                '%H:%M:%S / %d-%m-%Y', '%H:%M / %d-%m-%Y'):  # STOXXO Time/Date
         try:
             dt = datetime.strptime(raw, fmt)
-            # Date-only formats → return market open as proxy so curve still renders chronologically
             if dt.hour == 0 and dt.minute == 0 and ':' not in raw and 'T' not in raw:
-                return None  # no intraday signal — caller will skip time tracking
+                return None
             return dt.strftime('%H:%M')
         except ValueError:
             continue
-    # Last-resort: grab HH:MM from anywhere in the string
     m = re.search(r'(\d{2}):(\d{2})', raw)
     if m:
         h, mn = int(m.group(1)), int(m.group(2))
         if 0 <= h <= 23 and 0 <= mn <= 59:
             return f"{h:02d}:{mn:02d}"
     return None
+
+
+def _parse_trade_date(raw):
+    """Extract DD/MM/YYYY date from a broker time/date string."""
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    # STOXXO: '09:18:18 / 06-05-2026'
+    m = re.search(r'(\d{1,2})[-/](\d{1,2})[-/](\d{4})', raw)
+    if m:
+        d, mo, y = m.groups()
+        return f"{int(d):02d}/{int(mo):02d}/{int(y)}"
+    # ISO: '2026-05-06...'
+    m = re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', raw)
+    if m:
+        y, mo, d = m.groups()
+        return f"{int(d):02d}/{int(mo):02d}/{int(y)}"
+    return None
+
+
+# ── Margin model (post-Sep 2024 SEBI rules) ──
+# SHORT options: ~12% of notional (SPAN+Exposure approx) blocks margin.
+# On expiry day, additional ELM = 2% of notional (SEBI circular Sep 2024).
+# LONG options: only premium paid is "consumed" (no margin block beyond premium).
+SHORT_MARGIN_PCT     = 0.12   # SPAN + exposure approximation
+EXPIRY_ELM_PCT       = 0.02   # additional Extreme Loss Margin on expiry day
+
+def _required_margin(qty, strike, side, premium, is_expiry_day):
+    """Approximate margin required to hold an open option position."""
+    if qty <= 0 or strike is None or strike <= 0:
+        return 0.0
+    notional = qty * strike
+    if side == 'SHORT':
+        m = SHORT_MARGIN_PCT * notional
+        if is_expiry_day:
+            m += EXPIRY_ELM_PCT * notional
+        return m
+    # LONG: only premium is at stake; treat that as "capital used"
+    return qty * (premium or 0)
 
 
 def _detect_delimiter(text: str) -> str:
@@ -145,8 +183,18 @@ def _is_rejected(status: str) -> bool:
     return any(x in s for x in ('REJECT','CANCEL','EXPIRED','FAILED','ERROR'))
 
 
-def parse_orderbook_csv(csv_text: str) -> dict:
+def parse_orderbook_csv(csv_text: str, carry_in: list = None) -> dict:
+    """
+    Parse an order book CSV.
+
+    carry_in: optional list of dicts representing positions held coming INTO
+              this session (read from the OpenPosition table). Each entry:
+              {symbol, side ('SHORT'|'LONG'), qty, avg_price}
+              These are prepended to today's fills so VWAP-based realised P&L
+              correctly accounts for prior-session entry prices.
+    """
     warnings = []
+    carry_in = carry_in or []
 
     # Strip BOM
     csv_text = csv_text.lstrip('﻿')
@@ -161,9 +209,7 @@ def parse_orderbook_csv(csv_text: str) -> dict:
     if not rows:
         return {"error": "No data rows found in CSV"}
 
-    # Diagnose columns for debugging
     sample_keys = list(rows[0].keys()) if rows else []
-    # Detect broker from RAW headers (before normalisation) so signal columns match
     raw_first_row = next(csv.DictReader(io.StringIO(csv_text), delimiter=delim), {})
     broker = detect_broker(list(raw_first_row.keys())) if raw_first_row else 'Generic'
 
@@ -173,7 +219,27 @@ def parse_orderbook_csv(csv_text: str) -> dict:
     total_buy_val  = 0.0
     total_sell_val = 0.0
     skipped = 0
-    timed_trades = []   # list of (time_str, symbol, side, qty, price)
+    timed_trades = []
+    trade_dates  = []   # collected so we know if today == any expiry
+
+    # Seed fills with carry-in so VWAP P&L is computed against the real entry price
+    carry_seeded = set()
+    for c in carry_in:
+        try:
+            sym = c['symbol'].strip().upper()
+            side = c['side']
+            cqty = float(c['qty']); cpx = float(c['avg_price'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if cqty <= 0 or cpx <= 0:
+            continue
+        if side == 'SHORT':
+            fills[sym]["sells"].append({"qty": cqty, "price": cpx, "carry": True})
+            total_sell_val += cqty * cpx
+        elif side == 'LONG':
+            fills[sym]["buys"].append({"qty": cqty, "price": cpx, "carry": True})
+            total_buy_val += cqty * cpx
+        carry_seeded.add(sym)
 
     for row in rows:
         status_raw = _get(row, STATUS_COLS)
@@ -210,7 +276,6 @@ def parse_orderbook_csv(csv_text: str) -> dict:
         is_sell = any(x in side_raw for x in ('SELL','S','SHORT','SALE')) or side_raw == 'S'
 
         if not is_buy and not is_sell:
-            # Last resort: single char
             if side_raw in ('B',): is_buy = True
             elif side_raw in ('S',): is_sell = True
             else:
@@ -220,6 +285,9 @@ def parse_orderbook_csv(csv_text: str) -> dict:
         executed_count += 1
         value = qty * px
         t = _parse_time(time_raw)
+        d = _parse_trade_date(time_raw)
+        if d:
+            trade_dates.append(d)
 
         if is_buy:
             fills[symbol]["buys"].append({"qty": qty, "price": px})
@@ -239,9 +307,14 @@ def parse_orderbook_csv(csv_text: str) -> dict:
     if skipped > 0:
         warnings.append(f"{skipped} rows skipped (pending/open/unknown status)")
 
+    # Most-frequent trade date is the session date (used for ELM expiry-day check)
+    session_date = max(set(trade_dates), key=trade_dates.count) if trade_dates else None
+
     total_turnover = total_buy_val + total_sell_val
 
     strikes = []
+    open_positions_out = []   # to persist back into OpenPosition table
+    carry_in_realized = 0.0   # P&L specifically attributable to carry positions
     gross_pnl    = 0.0
     total_ce_pnl = 0.0
     total_pe_pnl = 0.0
@@ -261,6 +334,7 @@ def parse_orderbook_csv(csv_text: str) -> dict:
         open_side   = "BUY" if buy_qty > sell_qty else "SELL" if sell_qty > buy_qty else None
 
         sym_info = parse_symbol(symbol)
+        was_carry_in = symbol in carry_seeded
         strike_data = {
             "symbol":      symbol,
             "index":       sym_info["index"],
@@ -275,13 +349,31 @@ def parse_orderbook_csv(csv_text: str) -> dict:
             "realized":    round(realized, 2),
             "open_qty":    open_qty,
             "open_side":   open_side,
-            "is_carry":    open_qty > 0
+            "is_carry":    open_qty > 0,
+            "had_carry_in": was_carry_in,
         }
         strikes.append(strike_data)
         gross_pnl += realized
+        if was_carry_in:
+            carry_in_realized += realized
         opt = sym_info["option_type"]
         if opt == "CE": total_ce_pnl += realized
         elif opt == "PE": total_pe_pnl += realized
+
+        # Snapshot any still-open position for OpenPosition persistence
+        if open_qty > 0:
+            new_side = 'LONG' if open_side == 'BUY' else 'SHORT'
+            new_avg  = buy_vwap if new_side == 'LONG' else sell_vwap
+            open_positions_out.append({
+                "symbol":      symbol,
+                "side":        new_side,
+                "qty":         open_qty,
+                "avg_price":   round(new_avg, 2),
+                "expiry":      sym_info["expiry"],
+                "strike":      sym_info["strike"],
+                "option_type": sym_info["option_type"],
+                "index_name":  sym_info["index"],
+            })
 
     charges = compute_charges(total_buy_val, total_sell_val, total_turnover)
     net_pnl = gross_pnl - charges["total"]
@@ -291,32 +383,33 @@ def parse_orderbook_csv(csv_text: str) -> dict:
 
     strikes.sort(key=lambda x: x["realized"], reverse=True)
 
-    # ── Build intraday cumulative P&L curve from timed trades ──
+    # ── Intraday cumulative P&L curve + margin time-series ──
+    # We rebuild per-symbol running book at each tick. Margin is recomputed
+    # against current open qty using SHORT_MARGIN_PCT + ELM on expiry day.
     time_pnl = {}
+    margin_ts = {}
     if timed_trades:
-        # Build per-symbol running book to compute realised P&L at each trade
-        running = defaultdict(lambda: {"buys": [], "sells": []})
         timed_trades.sort(key=lambda x: x[0])
-        cum = 0.0
-        for t, sym, side, qty, px in timed_trades:
-            book = running[sym]
-            if side == 'BUY':
-                book["buys"].append({"qty": qty, "price": px})
-            else:
-                book["sells"].append({"qty": qty, "price": px})
-            bq = sum(f["qty"] for f in book["buys"])
-            sq = sum(f["qty"] for f in book["sells"])
-            bvwap = (sum(f["qty"]*f["price"] for f in book["buys"]) / bq) if bq else 0
-            svwap = (sum(f["qty"]*f["price"] for f in book["sells"]) / sq) if sq else 0
-            matched = min(bq, sq)
-            realized = round((svwap - bvwap) * matched, 2) if matched > 0 else 0.0
-            # Recalculate global cum from scratch is expensive; track per-sym realized delta
-            # Simple approach: recompute total realized across all symbols at this tick
-        # Recompute cleanly: for each timed trade, calculate full realised at that moment
-        running2 = defaultdict(lambda: {"buys": [], "sells": [], "last_realized": 0.0})
+
+        # Pre-seed running book with carry-in so realised P&L delta starts from
+        # the correct baseline (carry already counted in fills above).
+        running = defaultdict(lambda: {"buys": [], "sells": [], "last_realized": 0.0})
+        for c in carry_in:
+            try:
+                sym = c['symbol'].strip().upper()
+                side = c['side']; cqty = float(c['qty']); cpx = float(c['avg_price'])
+            except Exception:
+                continue
+            if cqty <= 0 or cpx <= 0:
+                continue
+            if side == 'SHORT':
+                running[sym]["sells"].append({"qty": cqty, "price": cpx})
+            elif side == 'LONG':
+                running[sym]["buys"].append({"qty": cqty, "price": cpx})
+
         cum_total = 0.0
         for t, sym, side, qty, px in timed_trades:
-            book = running2[sym]
+            book = running[sym]
             if side == 'BUY':
                 book["buys"].append({"qty": qty, "price": px})
             else:
@@ -332,9 +425,35 @@ def parse_orderbook_csv(csv_text: str) -> dict:
             cum_total += delta
             time_pnl[t] = round(cum_total, 2)
 
+            # Margin snapshot at this tick: sum across all symbols
+            tot_margin = 0.0
+            for s_sym, s_book in running.items():
+                s_bq = sum(f["qty"] for f in s_book["buys"])
+                s_sq = sum(f["qty"] for f in s_book["sells"])
+                s_open_qty = abs(s_bq - s_sq)
+                if s_open_qty <= 0:
+                    continue
+                s_side = 'SHORT' if s_sq > s_bq else 'LONG'
+                s_info = parse_symbol(s_sym)
+                strike = s_info.get("strike") or 0
+                expiry = s_info.get("expiry")
+                is_expiry = bool(session_date and expiry and session_date == expiry)
+                if s_side == 'SHORT':
+                    s_premium = (sum(f["qty"]*f["price"] for f in s_book["sells"]) / s_sq) if s_sq else 0
+                else:
+                    s_premium = (sum(f["qty"]*f["price"] for f in s_book["buys"]) / s_bq) if s_bq else 0
+                tot_margin += _required_margin(s_open_qty, strike, s_side, s_premium, is_expiry)
+            margin_ts[t] = round(tot_margin, 2)
+
+    # Final margin snapshot (end-of-session) for the headroom card
+    final_margin = max(margin_ts.values()) if margin_ts else 0.0
+    peak_margin  = final_margin   # peak == max of curve (already)
+    end_margin   = list(margin_ts.values())[-1] if margin_ts else 0.0
+
     return {
         "index_name":    index_name,
         "broker":        broker,
+        "session_date":  session_date,
         "gross_pnl":     round(gross_pnl, 2),
         "net_pnl":       round(net_pnl, 2),
         "ce_pnl":        round(total_ce_pnl, 2),
@@ -348,6 +467,12 @@ def parse_orderbook_csv(csv_text: str) -> dict:
         "rejected":      rejected_count,
         "strikes":       strikes,
         "warnings":      warnings,
-        "carry_positions": [s for s in strikes if s["is_carry"]],
+        "carry_positions":     [s for s in strikes if s["is_carry"]],
+        "open_positions_out":  open_positions_out,   # → write to OpenPosition table
+        "carry_in_count":      len(carry_in),
+        "carry_in_realized":   round(carry_in_realized, 2),
         "time_pnl":      time_pnl,
+        "margin_ts":     margin_ts,
+        "peak_margin":   round(peak_margin, 2),
+        "end_margin":    round(end_margin, 2),
     }

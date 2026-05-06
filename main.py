@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session as DBSession
 import json, os, base64
 
 from database import engine, get_db, Base
-from models import Session as SessionModel
+from models import Session as SessionModel, OpenPosition
 from schemas import SessionCreate, TokenRequest, TokenResponse, MessageResponse
 from auth import authenticate_user, create_access_token, get_current_user, require_admin
 from csv_parser import parse_orderbook_csv
@@ -24,7 +24,9 @@ def _migrate():
         ("strikes_json",           "TEXT DEFAULT '[]'"),
         ("charges_breakdown_json", "TEXT DEFAULT '{}'"),
         ("time_pnl_json",          "TEXT DEFAULT '{}'"),
+        ("margin_ts_json",         "TEXT DEFAULT '{}'"),
         ("journal_charts_json",    "TEXT DEFAULT '[]'"),
+        ("peak_margin",            "REAL"),
     ]
     with engine.connect() as conn:
         for col, definition in new_cols:
@@ -147,7 +149,15 @@ async def upload_csv(session_id: str, file: UploadFile = File(...),
             continue
     if csv_text is None:
         raise HTTPException(status_code=400, detail="Could not decode CSV file")
-    result = parse_orderbook_csv(csv_text)
+
+    # Read existing OpenPositions so the parser can match closing trades
+    # against prior-session entry prices (true carry P&L).
+    carry_in = [
+        {"symbol": op.symbol, "side": op.side, "qty": op.qty, "avg_price": op.avg_price}
+        for op in db.query(OpenPosition).all()
+    ]
+
+    result = parse_orderbook_csv(csv_text, carry_in=carry_in)
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
     row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
@@ -168,9 +178,28 @@ async def upload_csv(session_id: str, file: UploadFile = File(...),
     row.strikes_json           = json.dumps(result["strikes"])
     row.charges_breakdown_json = json.dumps(result["charges_breakdown"])
     row.time_pnl_json          = json.dumps(result.get("time_pnl", {}))
+    row.margin_ts_json         = json.dumps(result.get("margin_ts", {}))
+    row.peak_margin            = result.get("peak_margin", 0.0)
     if row.capital and row.capital > 0:
         row.net_roi   = round(result["net_pnl"]   / row.capital * 100, 4)
         row.gross_roi = round(result["gross_pnl"] / row.capital * 100, 4)
+
+    # ── Sync OpenPosition table ──
+    # Symbols traded in this session: clear their old open rows; for those that
+    # remain open after this session, write fresh rows with new VWAP.
+    traded_symbols = {s["symbol"] for s in result["strikes"]}
+    if traded_symbols:
+        db.query(OpenPosition).filter(OpenPosition.symbol.in_(traded_symbols)).delete(
+            synchronize_session=False
+        )
+    for op in result.get("open_positions_out", []):
+        db.add(OpenPosition(
+            symbol=op["symbol"], side=op["side"], qty=op["qty"],
+            avg_price=op["avg_price"], expiry=op["expiry"],
+            strike=op["strike"], option_type=op["option_type"],
+            index_name=op["index_name"], last_session_id=session_id,
+        ))
+
     db.commit()
     return {
         "session_id": session_id, "gross_pnl": result["gross_pnl"],
@@ -179,9 +208,71 @@ async def upload_csv(session_id: str, file: UploadFile = File(...),
         "total_charges": result["total_charges"], "executed": result["executed"],
         "rejected": result["rejected"], "strikes": result["strikes"],
         "carry_positions": result["carry_positions"], "warnings": result["warnings"],
+        "carry_in_count":    result.get("carry_in_count", 0),
+        "carry_in_realized": result.get("carry_in_realized", 0.0),
+        "peak_margin":       result.get("peak_margin", 0.0),
         "broker":  result.get("broker", "Generic"),
         "message": f"[{result.get('broker','Generic')}] Parsed {result['executed']} orders, {len(result['strikes'])} strikes"
     }
+
+
+# ── OPEN POSITIONS (carry table) ──
+@app.get("/open-positions", tags=["Carry"])
+def list_open_positions(db: DBSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    rows = db.query(OpenPosition).order_by(OpenPosition.symbol).all()
+    return [{
+        "symbol": r.symbol, "side": r.side, "qty": r.qty, "avg_price": r.avg_price,
+        "expiry": r.expiry, "strike": r.strike, "option_type": r.option_type,
+        "index_name": r.index_name, "last_session_id": r.last_session_id,
+        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+    } for r in rows]
+
+@app.delete("/open-positions", tags=["Carry"])
+def clear_open_positions(db: DBSession = Depends(get_db), user: dict = Depends(require_admin)):
+    n = db.query(OpenPosition).delete()
+    db.commit()
+    return {"message": f"Cleared {n} open positions. Re-upload sessions in date order to rebuild."}
+
+@app.post("/open-positions/rebuild", tags=["Carry"])
+def rebuild_open_positions(db: DBSession = Depends(get_db), user: dict = Depends(require_admin)):
+    """Wipe the carry table, then re-process every session's stored CSV in date order."""
+    db.query(OpenPosition).delete()
+    db.commit()
+    sessions = db.query(SessionModel).filter(SessionModel.csv_data != None).order_by(SessionModel.id).all()
+    rebuilt = 0
+    for s in sessions:
+        carry_in = [
+            {"symbol": op.symbol, "side": op.side, "qty": op.qty, "avg_price": op.avg_price}
+            for op in db.query(OpenPosition).all()
+        ]
+        result = parse_orderbook_csv(s.csv_data, carry_in=carry_in)
+        if "error" in result:
+            continue
+        traded = {st["symbol"] for st in result["strikes"]}
+        if traded:
+            db.query(OpenPosition).filter(OpenPosition.symbol.in_(traded)).delete(
+                synchronize_session=False
+            )
+        for op in result.get("open_positions_out", []):
+            db.add(OpenPosition(
+                symbol=op["symbol"], side=op["side"], qty=op["qty"],
+                avg_price=op["avg_price"], expiry=op["expiry"],
+                strike=op["strike"], option_type=op["option_type"],
+                index_name=op["index_name"], last_session_id=s.id,
+            ))
+        # also refresh session-level numbers since carry-in changed P&L
+        s.gross_pnl = result["gross_pnl"]; s.net_pnl = result["net_pnl"]
+        s.ce_pnl = result["ce_pnl"];       s.pe_pnl = result["pe_pnl"]
+        s.charges = result["total_charges"]
+        s.strikes_json = json.dumps(result["strikes"])
+        s.margin_ts_json = json.dumps(result.get("margin_ts", {}))
+        s.peak_margin = result.get("peak_margin", 0.0)
+        if s.capital and s.capital > 0:
+            s.net_roi   = round(result["net_pnl"]   / s.capital * 100, 4)
+            s.gross_roi = round(result["gross_pnl"] / s.capital * 100, 4)
+        db.commit()
+        rebuilt += 1
+    return {"message": f"Rebuilt {rebuilt} sessions in date order."}
 
 # ── CHART UPLOAD ──
 @app.post("/upload-chart/{session_id}", tags=["Charts"])
@@ -308,5 +399,7 @@ def _row_to_dict(r):
         "strikes":            json.loads(r.strikes_json or "[]"),
         "charges_breakdown":  json.loads(r.charges_breakdown_json or "{}"),
         "time_pnl":           json.loads(r.time_pnl_json or "{}"),
+        "margin_ts":          json.loads(r.margin_ts_json or "{}"),
+        "peak_margin":        r.peak_margin,
         "journal_charts":     json.loads(r.journal_charts_json or "[]"),
     }

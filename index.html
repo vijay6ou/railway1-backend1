@@ -192,6 +192,19 @@ label{font-size:11px;color:var(--tx2);margin-bottom:4px;display:block;font-weigh
 .hm-bar{flex:1;height:26px;border-radius:4px;display:flex;align-items:center;padding:0 10px;justify-content:flex-end}
 .hm-val{font-family:var(--fm);font-size:10px;font-weight:500}
 
+/* ── STRIKE LADDER HEATMAP ── */
+.ladder-head{display:grid;grid-template-columns:1fr 84px 1fr;gap:6px;padding:0 0 6px;border-bottom:1px solid var(--bd);margin-bottom:6px}
+.ladder-head-pe{text-align:right;font-size:10px;color:var(--gr);font-weight:600;letter-spacing:.5px}
+.ladder-head-ce{text-align:left;font-size:10px;color:var(--rd);font-weight:600;letter-spacing:.5px}
+.ladder-head-strike{text-align:center;font-size:10px;color:var(--tx3);font-weight:600;letter-spacing:.5px}
+.ladder-grid{display:flex;flex-direction:column;gap:3px}
+.ladder-row{display:grid;grid-template-columns:1fr 84px 1fr;gap:6px;align-items:stretch}
+.ladder-strike{display:flex;align-items:center;justify-content:center;font-family:var(--fm);font-size:12px;font-weight:600;color:var(--tx2);background:var(--s2,#f3f4f6);border-radius:4px;padding:4px 0;min-height:34px}
+.ladder-cell{min-height:34px;border-radius:4px;display:flex;flex-direction:column;justify-content:center;padding:4px 10px;gap:1px}
+.ladder-cell-pnl{font-family:var(--fm);font-size:11px;font-weight:600;line-height:1.2}
+.ladder-cell-qty{font-family:var(--fm);font-size:9px;color:var(--tx3);line-height:1.1}
+.ladder-empty{background:repeating-linear-gradient(45deg,transparent,transparent 4px,rgba(0,0,0,.02) 4px,rgba(0,0,0,.02) 8px);min-height:34px}
+
 /* ── EMPTY STATE ── */
 .empty{text-align:center;padding:40px 20px;color:var(--tx3)}
 .empty-ico{font-size:36px;margin-bottom:10px;display:block}
@@ -431,6 +444,8 @@ async function loadSessions() {
       open: st.is_carry
     })) : (s.positions || []),
     time_pnl: s.time_pnl || {},
+    margin_ts: s.margin_ts || {},
+    peak_margin: s.peak_margin || 0,
     carry_out: s.carry_out || 0,
     dte: s.dte || 0,
     chart_img: s.chart_image || null,
@@ -1592,16 +1607,84 @@ function vStrikes() {
       </div>
     </div>
 
-    ${s.time_pnl&&Object.keys(s.time_pnl).length ? `
+    ${_renderStrikeLadder(s)}
+
+    ${(s.margin_ts && Object.keys(s.margin_ts).length) ? `
     <div class="card">
-      <div class="card-title">Time-of-Day Cumulative P&L</div>
-      ${Object.entries(s.time_pnl).map(([t,v])=>{
-        const maxV=Math.max(...Object.values(s.time_pnl).map(Math.abs),1);
-        const pct=Math.abs(v)/maxV*100;
-        const bg=v>0?`rgba(26,127,55,${.08+pct*.007})`:`rgba(201,57,52,${.08+pct*.007})`;
-        return `<div class="hm-row"><div class="hm-lbl">${t}</div><div class="hm-bar" style="background:${bg}"><span class="hm-val ${v>=0?'pos':'neg'}">${fmtInr(v)}</span></div></div>`;
-      }).join('')}
+      <div class="card-title">Margin / Risk Headroom
+        <span class="card-badge">live from positions</span>
+      </div>
+      <div style="display:flex;gap:18px;margin:6px 0 10px;font-size:11px;color:var(--tx2);font-family:var(--fm);flex-wrap:wrap">
+        <span>Peak: <span style="color:var(--rd);font-weight:600">${fmtInr(s.peak_margin||0)}</span></span>
+        <span>Capital: <span style="color:var(--bl);font-weight:600">${fmtInr(s.capital||0)}</span></span>
+        <span>Headroom at peak: <span class="${(s.capital||0)-(s.peak_margin||0) >= 0 ? 'pos':'neg'}">${fmtInr((s.capital||0)-(s.peak_margin||0))}</span></span>
+        <span>Rejections: <span style="color:var(--am);font-weight:600">${s.rejected||0}</span></span>
+      </div>
+      <div class="chart-wrap"><canvas id="margin-headroom-chart"></canvas></div>
+      <div style="margin-top:8px;font-size:10px;color:var(--tx3);line-height:1.5">
+        Approx margin = 12% of notional for shorts (SPAN+Exposure) +2% ELM on expiry day, plus premium for longs.
+        Real broker block can vary ±15% based on SPAN scenarios.
+      </div>
     </div>` : ''}`;
+}
+
+// ── Strike Ladder Heatmap (HTML grid) ──
+function _renderStrikeLadder(s) {
+  const pos = s.positions || [];
+  if (!pos.length) return '';
+  const rows = {};
+  pos.forEach(p => {
+    const k = String(_strikeNum(p.sym) || '');
+    if (!k) return;
+    if (!rows[k]) rows[k] = { ce: null, pe: null };
+    const sideKey = (p.sym||'').toUpperCase().endsWith('CE') ? 'ce' : 'pe';
+    rows[k][sideKey] = p;
+  });
+  const strikes = Object.keys(rows).map(Number).sort((a,b) => b - a);  // high to low
+  if (!strikes.length) return '';
+
+  const maxAbsPnl = Math.max(...pos.map(p => Math.abs(p.pnl||0)), 1);
+
+  const cell = (p, side) => {
+    if (!p) return `<div class="ladder-cell ladder-empty"></div>`;
+    const pnl = p.pnl || 0;
+    const pct = Math.min(Math.abs(pnl) / maxAbsPnl, 1);
+    const bg = pnl >= 0
+      ? `rgba(26,127,55,${0.10 + pct * 0.55})`
+      : `rgba(201,57,52,${0.10 + pct * 0.55})`;
+    const align = side === 'pe' ? 'flex-end' : 'flex-start';
+    return `
+      <div class="ladder-cell" style="background:${bg};justify-content:${align}" title="${p.sym||''} · Qty ${p.qty||0} · ${p.side||''}${p.open?' · OPEN':''}">
+        <div class="ladder-cell-pnl ${pnl>=0?'pos':'neg'}">${fmtInr(pnl)}</div>
+        <div class="ladder-cell-qty">${p.qty||0}${p.open?' ⚠':''}</div>
+      </div>`;
+  };
+
+  return `
+  <div class="card">
+    <div class="card-title">Strike Ladder Heatmap
+      <span class="card-badge">${strikes.length} strikes · color = realised P&L · area = qty</span>
+    </div>
+    <div class="ladder-head">
+      <div class="ladder-head-pe">PUT (PE)</div>
+      <div class="ladder-head-strike">STRIKE</div>
+      <div class="ladder-head-ce">CALL (CE)</div>
+    </div>
+    <div class="ladder-grid">
+      ${strikes.map(k => `
+        <div class="ladder-row">
+          ${cell(rows[k].pe, 'pe')}
+          <div class="ladder-strike">${k}</div>
+          ${cell(rows[k].ce, 'ce')}
+        </div>`).join('')}
+    </div>
+    <div style="display:flex;gap:14px;margin-top:10px;font-size:11px;color:var(--tx2);justify-content:center;flex-wrap:wrap">
+      <span>PE Net: <span class="${(s.pe_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.pe_pnl||0)}</span></span>
+      <span>CE Net: <span class="${(s.ce_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.ce_pnl||0)}</span></span>
+      <span>Gross: <span class="${(s.gross_pnl||0)>=0?'pos':'neg'}">${fmtInr(s.gross_pnl||0)}</span></span>
+      ${s.carry_in_count ? `<span style="color:var(--am)">Carry-in: ${s.carry_in_count} pos · ${fmtInr(s.carry_in_realized||0)} P&L</span>` : ''}
+    </div>
+  </div>`;
 }
 
 function buildStrikeCharts() {
@@ -1642,6 +1725,86 @@ function buildStrikeCharts() {
 
   CHARTS.strikeCe = buildSide('strike-ce-chart', ce, 'ce');
   CHARTS.strikePe = buildSide('strike-pe-chart', pe, 'pe');
+
+  buildMarginHeadroomChart();
+}
+
+function buildMarginHeadroomChart() {
+  const s = CUR; if (!s) return;
+  const ts = s.margin_ts || {};
+  const keys = Object.keys(ts).sort();
+  if (!keys.length) return;
+  const el = document.getElementById('margin-headroom-chart');
+  if (!el) return;
+  if (CHARTS.marginHr) { CHARTS.marginHr.destroy(); delete CHARTS.marginHr; }
+
+  const labels = keys;
+  const data   = keys.map(k => ts[k]);
+  const cap    = s.capital || 0;
+  const capLine = keys.map(_ => cap);
+
+  // Color points red when over capital, amber when within 90-100% of cap, green otherwise
+  const ptColors = data.map(v => {
+    if (cap <= 0) return 'rgba(31,41,55,.7)';
+    if (v > cap)        return 'rgba(201,57,52,.95)';
+    if (v > cap * 0.9)  return 'rgba(154,103,0,.95)';
+    return 'rgba(26,127,55,.85)';
+  });
+
+  CHARTS.marginHr = new Chart(el, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Margin used',
+          data,
+          borderColor: 'rgba(31,41,55,.85)',
+          backgroundColor: 'rgba(31,41,55,.10)',
+          borderWidth: 2,
+          fill: true,
+          tension: 0.25,
+          pointRadius: 2.5,
+          pointBackgroundColor: ptColors,
+          pointBorderColor: ptColors,
+        },
+        cap > 0 ? {
+          label: `Capital cap (${fmtInr(cap)})`,
+          data: capLine,
+          borderColor: 'rgba(31,108,200,.95)',
+          borderWidth: 1.5,
+          borderDash: [6, 4],
+          pointRadius: 0,
+          fill: false,
+        } : null,
+      ].filter(Boolean),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: true, labels: { font: { size: 11 }, color: '#4b5563' } },
+        tooltip: {
+          callbacks: {
+            title: ctx => ctx[0].label,
+            label: ctx => {
+              const v = ctx.parsed.y;
+              if (ctx.datasetIndex === 0) {
+                const ratio = cap > 0 ? (v / cap * 100).toFixed(1) + '% of cap' : '';
+                return `Margin: ${fmtInr(v)}${ratio ? ' · ' + ratio : ''}`;
+              }
+              return `Cap: ${fmtInr(v)}`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: { grid: { color: '#eef1f4' }, ticks: { color: '#6b7280', font: { size: 9, family: "'JetBrains Mono'" }, maxRotation: 0, autoSkipPadding: 18 } },
+        y: { grid: { color: '#d0d7de' }, ticks: { color: '#6b7280', font: { size: 9 }, callback: v => fmtInr(v) } }
+      }
+    }
+  });
 }
 
 // ══════════════════════════════════════════════════════════════
