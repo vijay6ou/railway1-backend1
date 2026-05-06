@@ -145,25 +145,146 @@ def _parse_trade_date(raw):
     return None
 
 
-# ── Margin model (post-Sep 2024 SEBI rules) ──
-# SHORT options: ~12% of notional (SPAN+Exposure approx) blocks margin.
-# On expiry day, additional ELM = 2% of notional (SEBI circular Sep 2024).
-# LONG options: only premium paid is "consumed" (no margin block beyond premium).
-SHORT_MARGIN_PCT     = 0.12   # SPAN + exposure approximation
-EXPIRY_ELM_PCT       = 0.02   # additional Extreme Loss Margin on expiry day
+# ── Margin model (post-Sep 2024 SEBI rules, with hedge/spread detection) ──
+#
+# Components per SEBI / NSE F&O margin framework:
+#   SPAN      — scenario-based VaR (price + vol scan). Approx by moneyness band:
+#               deep-OTM ≈ 6%, OTM ≈ 8%, ATM ≈ 11%, ITM ≈ 13%, deep-ITM ≈ 16%
+#   Exposure  — flat 3% of notional for index options (5% for stock)
+#   ELM       — +2% of notional for SHORT options ON EXPIRY DAY only
+#               (SEBI circular CIR/MRD/DP/03/2024, effective Nov 2024)
+#   Spread    — when SHORT and LONG of same opt_type held simultaneously,
+#               the hedged qty consumes only spread_width × qty (max loss),
+#               not the naked-short SPAN+Exposure. Applied per (index, opt_type).
+#   Long premium — for excess longs (not hedging a short), premium paid is
+#                  treated as capital consumed (no margin block beyond it).
 
-def _required_margin(qty, strike, side, premium, is_expiry_day):
-    """Approximate margin required to hold an open option position."""
-    if qty <= 0 or strike is None or strike <= 0:
+EXPOSURE_PCT     = 0.03  # Exposure margin for index options
+EXPIRY_ELM_PCT   = 0.02  # Extreme Loss Margin on expiry day for shorts
+
+
+def _span_pct(strike, spot, opt_type):
+    """SPAN margin % of notional, scaled by distance from spot.
+    Approximates exchange scenario-based margin without scenario data."""
+    if not spot or spot <= 0 or not strike:
+        return 0.10  # conservative default when spot unknown
+    if opt_type == 'CE':
+        moneyness = (strike - spot) / spot   # +ve = OTM call (short safer)
+    else:                                     # PE
+        moneyness = (spot - strike) / spot   # +ve = OTM put (short safer)
+    if moneyness >= 0.05:  return 0.06   # deep OTM
+    if moneyness >= 0.02:  return 0.08   # OTM
+    if moneyness >= -0.02: return 0.11   # ATM
+    if moneyness >= -0.05: return 0.13   # ITM
+    return 0.16                          # deep ITM
+
+
+def _spot_proxy(positions):
+    """Estimate spot per index from open legs.
+    Uses qty-weighted midpoint of the strike range — good proxy when traders
+    cluster strikes around ATM (typical for option sellers)."""
+    spots = {}
+    by_idx = defaultdict(list)  # idx -> list of (strike, qty)
+    for p in positions:
+        if p.get('index') and p.get('strike') and p.get('qty'):
+            by_idx[p['index']].append((p['strike'], p['qty']))
+    for idx, items in by_idx.items():
+        if not items:
+            continue
+        # Range midpoint is the simplest decent proxy — better than weighted avg
+        # because traders deliberately cluster strikes around current spot.
+        ks = [k for k, _ in items]
+        spots[idx] = (min(ks) + max(ks)) / 2.0
+    return spots
+
+
+def _compute_total_margin(positions, session_date):
+    """
+    positions: list of open-leg dicts:
+        {symbol, index, opt_type, strike, side ('SHORT'|'LONG'), qty, vwap, expiry}
+    Returns total margin required across all legs, with spread/hedge pairing
+    applied per (index, opt_type) bucket.
+    """
+    if not positions:
         return 0.0
-    notional = qty * strike
-    if side == 'SHORT':
-        m = SHORT_MARGIN_PCT * notional
-        if is_expiry_day:
-            m += EXPIRY_ELM_PCT * notional
-        return m
-    # LONG: only premium is at stake; treat that as "capital used"
-    return qty * (premium or 0)
+    spots = _spot_proxy(positions)
+
+    # Group by (index, opt_type)
+    groups = defaultdict(lambda: {'shorts': [], 'longs': []})
+    for p in positions:
+        key = (p.get('index'), p.get('opt_type'))
+        bucket = 'shorts' if p['side'] == 'SHORT' else 'longs'
+        groups[key][bucket].append(p)
+
+    total = 0.0
+    for (idx, ot), g in groups.items():
+        if not idx or not ot:
+            continue
+        spot = spots.get(idx, 0)
+        shorts = g['shorts']
+        longs  = g['longs']
+
+        ts_qty = sum(s['qty'] for s in shorts)
+        tl_qty = sum(l['qty'] for l in longs)
+
+        # ── Spread benefit (hedged qty) ──
+        hedged_qty = min(ts_qty, tl_qty)
+        if hedged_qty > 0 and shorts and longs:
+            # qty-weighted avg strikes give a representative spread width
+            avg_short_k = sum(s['qty'] * s['strike'] for s in shorts) / ts_qty
+            avg_long_k  = sum(l['qty'] * l['strike'] for l in longs)  / tl_qty
+            spread_width = abs(avg_short_k - avg_long_k)
+            # max-loss spread margin (exact for vertical credit/debit spreads)
+            total += spread_width * hedged_qty
+
+        # ── Naked short residue ──
+        naked_short_qty = ts_qty - hedged_qty
+        if naked_short_qty > 0:
+            avg_strike = sum(s['qty'] * s['strike'] for s in shorts) / ts_qty
+            span_p = _span_pct(avg_strike, spot, ot)
+            notional = naked_short_qty * avg_strike
+            naked = (span_p + EXPOSURE_PCT) * notional
+            # ELM only if any short leg in this group expires on session date
+            if session_date and any(s.get('expiry') == session_date for s in shorts):
+                naked += EXPIRY_ELM_PCT * notional
+            total += naked
+
+        # ── Excess longs (no short to hedge) — only premium paid ──
+        excess_long_qty = tl_qty - hedged_qty
+        if excess_long_qty > 0 and tl_qty > 0:
+            avg_long_vwap = sum(l['qty'] * l['vwap'] for l in longs) / tl_qty
+            total += excess_long_qty * avg_long_vwap
+
+    return total
+
+
+def _open_legs_from_book(running_book):
+    """Build the per-leg open-positions list used by _compute_total_margin
+    from the running fills book at a given tick."""
+    legs = []
+    for sym, book in running_book.items():
+        bq = sum(f["qty"] for f in book["buys"])
+        sq = sum(f["qty"] for f in book["sells"])
+        open_qty = abs(bq - sq)
+        if open_qty <= 0:
+            continue
+        side = 'SHORT' if sq > bq else 'LONG'
+        if side == 'SHORT':
+            vwap = sum(f["qty"]*f["price"] for f in book["sells"]) / sq if sq else 0
+        else:
+            vwap = sum(f["qty"]*f["price"] for f in book["buys"]) / bq if bq else 0
+        info = parse_symbol(sym)
+        legs.append({
+            'symbol':   sym,
+            'index':    info.get('index'),
+            'opt_type': info.get('option_type'),
+            'strike':   info.get('strike'),
+            'expiry':   info.get('expiry'),
+            'side':     side,
+            'qty':      open_qty,
+            'vwap':     vwap,
+        })
+    return legs
 
 
 def _detect_delimiter(text: str) -> str:
@@ -425,25 +546,11 @@ def parse_orderbook_csv(csv_text: str, carry_in: list = None) -> dict:
             cum_total += delta
             time_pnl[t] = round(cum_total, 2)
 
-            # Margin snapshot at this tick: sum across all symbols
-            tot_margin = 0.0
-            for s_sym, s_book in running.items():
-                s_bq = sum(f["qty"] for f in s_book["buys"])
-                s_sq = sum(f["qty"] for f in s_book["sells"])
-                s_open_qty = abs(s_bq - s_sq)
-                if s_open_qty <= 0:
-                    continue
-                s_side = 'SHORT' if s_sq > s_bq else 'LONG'
-                s_info = parse_symbol(s_sym)
-                strike = s_info.get("strike") or 0
-                expiry = s_info.get("expiry")
-                is_expiry = bool(session_date and expiry and session_date == expiry)
-                if s_side == 'SHORT':
-                    s_premium = (sum(f["qty"]*f["price"] for f in s_book["sells"]) / s_sq) if s_sq else 0
-                else:
-                    s_premium = (sum(f["qty"]*f["price"] for f in s_book["buys"]) / s_bq) if s_bq else 0
-                tot_margin += _required_margin(s_open_qty, strike, s_side, s_premium, is_expiry)
-            margin_ts[t] = round(tot_margin, 2)
+            # Margin snapshot at this tick — uses spread/hedge-aware model.
+            # Same timestamp ticks that occur in the same minute keep only the
+            # last value (margin only changes when book changes, last is correct).
+            legs = _open_legs_from_book(running)
+            margin_ts[t] = round(_compute_total_margin(legs, session_date), 2)
 
     # Final margin snapshot (end-of-session) for the headroom card
     final_margin = max(margin_ts.values()) if margin_ts else 0.0
