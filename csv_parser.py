@@ -11,16 +11,14 @@ from datetime import datetime
 
 
 # ── Column name alias map (covers Zerodha, Upstox, Angel, Fyers, IIFL, 5paisa, STOXXO/Jainam) ──
-SYMBOL_COLS   = ['symbol','tradingsymbol','trading_symbol','scripname','scrip_name','scrip',
-                 'instrument','instrumentname','instrument_name','stock','contractname','contract']
+SYMBOL_COLS   = ['symbolname','symbol','tradingsymbol','scripname','scrip',
+                 'instrument','instrumentname','stock','contractname','contract']
 SIDE_COLS     = ['side','transactiontype','transaction_type','buysell','buy/sell','buy_sell',
                  'type','order_type','ordertype','b/s','direction','tradetype','trade_type',
                  'orderside','txnside']
-TIME_COLS     = ['time','tradetime','trade_time','ordertime','order_time','timestamp',
-                 'executiontime','execution_time','tradeddatetime','traded_datetime',
-                 'exchangetime','exchange_time','tradedat','tradedtime',
-                 'orderexecutiontime','order_execution_time','exchange_order_time',
-                 'exchordertime','fill_time','filltime']
+TIME_COLS     = ['time','tradetime','ordertime','timestamp','timedate','datetime',
+                 'executiontime','tradeddatetime','exchangetime','tradedat','tradedtime',
+                 'orderexecutiontime','exchangeordertime','exchordertime','filltime']
 DATE_COLS     = ['tradedate','trade_date','date','orderdate','order_date','executiondate']
 QTY_COLS      = ['tradeqty','trade_qty','qty','filledqty','filled_qty','quantity',
                  'tradedqty','traded_qty','executedqty','executed_qty','lotsize','lots',
@@ -44,10 +42,10 @@ BROKER_FORMATS = [
 
 def detect_broker(headers):
     """Identify broker from CSV headers via exact column match (after normalisation)."""
-    norm = set(re.sub(r'[\s_\-\.]+','',h.strip().lower()) for h in headers)
+    norm = set(re.sub(r'[\s_\-\./]+','',h.strip().lower()) for h in headers)
     best, best_ratio, best_score = 'Generic', 0.0, 0
     for name, signals in BROKER_FORMATS:
-        sigs = [re.sub(r'[\s_\-\.]+','',s) for s in signals]
+        sigs = [re.sub(r'[\s_\-\./]+','',s) for s in signals]
         score = sum(1 for s in sigs if s in norm)
         if score < max(2, len(sigs) * 0.6):
             continue
@@ -66,7 +64,7 @@ def _get(row, cols):
 
 def _norm_cols(row):
     """Normalize column names: lower, strip, collapse separators."""
-    return {re.sub(r'[\s_\-\.]+','',k.strip().lower()): v.strip() if isinstance(v,str) else v
+    return {re.sub(r'[\s_\-\./]+','',k.strip().lower()): v.strip() if isinstance(v,str) else v
             for k,v in row.items()}
 
 
@@ -75,13 +73,18 @@ def parse_symbol(symbol: str) -> dict:
     s = symbol.upper().strip()
     # Standard compact format: INDEX + YYMMDD + STRIKE + CE/PE
     m = re.match(
-        r'^(NIFTY|BANKNIFTY|SENSEX|FINNIFTY|MIDCPNIFTY|BANKEX)(\d{5,6})(\d{4,6})(CE|PE)$', s)
+        r'^(NIFTY|BANKNIFTY|SENSEX|FINNIFTY|MIDCPNIFTY|BANKEX)(\d{5,6}?)(\d{4,6})(CE|PE)$', s)
     if m:
         index, expiry_raw, strike, opt_type = m.groups()
         try:
             yr = 2000 + int(expiry_raw[:2])
-            mo = int(expiry_raw[2:4])
-            dy = int(expiry_raw[4:])
+            # 5-char = YYMDD (single-digit month for Jan-Sep), 6-char = YYMMDD
+            if len(expiry_raw) == 5:
+                mo = int(expiry_raw[2:3])
+                dy = int(expiry_raw[3:5])
+            else:
+                mo = int(expiry_raw[2:4])
+                dy = int(expiry_raw[4:6])
             expiry = f"{dy:02d}/{mo:02d}/{yr}"
         except Exception:
             expiry = expiry_raw
