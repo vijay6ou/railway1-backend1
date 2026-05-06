@@ -18,7 +18,16 @@ Base.metadata.create_all(bind=engine)
 
 # ── COLUMN MIGRATIONS (safe ADD COLUMN for existing deployments) ──
 def _migrate():
-    """Add new columns to existing sessions table without dropping data."""
+    """
+    Add new columns to the sessions table without dropping data.
+    Postgres-safe: inspect existing columns FIRST to avoid the
+    'current transaction is aborted' cascade that follows a duplicate-column
+    error when running multiple ALTER TABLEs in one connection.
+    Float type differs (SQLite: REAL, Postgres: DOUBLE PRECISION) — picked per dialect.
+    """
+    from sqlalchemy import inspect, text
+    is_pg = engine.dialect.name == "postgresql"
+    float_type = "DOUBLE PRECISION" if is_pg else "REAL"
     new_cols = [
         ("journal",                "TEXT"),
         ("strikes_json",           "TEXT DEFAULT '[]'"),
@@ -26,20 +35,29 @@ def _migrate():
         ("time_pnl_json",          "TEXT DEFAULT '{}'"),
         ("margin_ts_json",         "TEXT DEFAULT '{}'"),
         ("journal_charts_json",    "TEXT DEFAULT '[]'"),
-        ("peak_margin",            "REAL"),
+        ("peak_margin",            float_type),
     ]
-    with engine.connect() as conn:
-        for col, definition in new_cols:
-            try:
-                conn.execute(__import__("sqlalchemy").text(
-                    f"ALTER TABLE sessions ADD COLUMN {col} {definition}"
-                ))
-                conn.commit()
-            except Exception:
-                pass  # column already exists — ignore
+    insp = inspect(engine)
+    if "sessions" not in insp.get_table_names():
+        return  # fresh DB; create_all already made the full schema
+    existing = {c["name"] for c in insp.get_columns("sessions")}
+    for col, definition in new_cols:
+        if col in existing:
+            continue
+        # Use a fresh connection per ALTER so a failure on one doesn't poison the rest
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE sessions ADD COLUMN {col} {definition}"))
+        except Exception as e:
+            # Best-effort: log and continue. App can still run if a column add fails.
+            print(f"[migrate] skip {col}: {e}")
 
 _migrate()
-seed()
+try:
+    seed()
+except Exception as e:
+    # Don't kill the app if seed fails (e.g. Postgres uniqueness on rerun).
+    print(f"[seed] skipped: {e}")
 
 app = FastAPI(title="VJ Trading Dashboard", version="3.0.0",
               docs_url="/api/docs", openapi_url="/api/openapi.json")
