@@ -4,15 +4,18 @@ VJ Trading Dashboard — FastAPI v3
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session as DBSession
-import json, os, base64
+import json, os, base64, logging
 
-from database import engine, get_db, Base
+from database import engine, get_db, Base, DATABASE_URL
 from models import Session as SessionModel, OpenPosition
 from schemas import SessionCreate, TokenRequest, TokenResponse, MessageResponse
 from auth import authenticate_user, create_access_token, get_current_user, require_admin
 from csv_parser import parse_orderbook_csv
 from seed import seed
+
+logger = logging.getLogger(__name__)
 
 Base.metadata.create_all(bind=engine)
 
@@ -28,15 +31,38 @@ def _migrate():
         ("journal_charts_json",    "TEXT DEFAULT '[]'"),
         ("peak_margin",            "REAL"),
     ]
+
+    is_postgres = DATABASE_URL.startswith("postgresql")
+
     with engine.connect() as conn:
         for col, definition in new_cols:
             try:
-                conn.execute(__import__("sqlalchemy").text(
+                # Check information_schema first so we never attempt an ALTER
+                # that would abort the transaction on PostgreSQL.
+                if is_postgres:
+                    exists = conn.execute(text(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name = 'sessions' AND column_name = :col"
+                    ), {"col": col}).fetchone()
+                else:
+                    # SQLite: PRAGMA table_info returns one row per column
+                    rows = conn.execute(text(
+                        "PRAGMA table_info(sessions)"
+                    )).fetchall()
+                    exists = any(row[1] == col for row in rows)
+
+                if exists:
+                    logger.info("_migrate: column '%s' already exists — skipping", col)
+                    continue
+
+                conn.execute(text(
                     f"ALTER TABLE sessions ADD COLUMN {col} {definition}"
                 ))
                 conn.commit()
-            except Exception:
-                pass  # column already exists — ignore
+                logger.info("_migrate: added column '%s %s'", col, definition)
+            except Exception as exc:
+                logger.error("_migrate: failed to add column '%s': %s", col, exc)
+                conn.rollback()
 
 _migrate()
 seed()
