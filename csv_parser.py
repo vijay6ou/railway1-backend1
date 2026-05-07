@@ -343,7 +343,11 @@ def parse_orderbook_csv(csv_text: str, carry_in: list = None) -> dict:
     timed_trades = []
     trade_dates  = []   # collected so we know if today == any expiry
 
-    # Seed fills with carry-in so VWAP P&L is computed against the real entry price
+    # Seed fills with carry-in so VWAP P&L is computed against the real entry price.
+    # IMPORTANT: do NOT add carry-in qty*price into total_buy_val/total_sell_val.
+    # Those totals feed compute_charges(); the prior session has already been
+    # charged STT/exchange/etc. on that same value, so adding it here would
+    # double-charge today's session and depress today's net P&L.
     carry_seeded = set()
     for c in carry_in:
         try:
@@ -356,10 +360,8 @@ def parse_orderbook_csv(csv_text: str, carry_in: list = None) -> dict:
             continue
         if side == 'SHORT':
             fills[sym]["sells"].append({"qty": cqty, "price": cpx, "carry": True})
-            total_sell_val += cqty * cpx
         elif side == 'LONG':
             fills[sym]["buys"].append({"qty": cqty, "price": cpx, "carry": True})
-            total_buy_val += cqty * cpx
         carry_seeded.add(sym)
 
     for row in rows:
