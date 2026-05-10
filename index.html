@@ -1279,7 +1279,10 @@ async function saveFromUpload() {
   };
   try {
     await saveSession(sess);
-    // Upload raw CSV to backend for server-side parsing (strikes, charges, time_pnl)
+    // Upload raw CSV to backend for server-side parsing (strikes, charges, time_pnl).
+    // Backend may rewrite the session id to match the actual trade date in the CSV
+    // (or in the filename) — we honor that and follow the canonical id afterwards.
+    let canonicalId = dateId;
     if (RAW.csvFile) {
       const fd = new FormData();
       fd.append('file', RAW.csvFile, RAW.csvFile.name || 'orderbook.csv');
@@ -1289,19 +1292,27 @@ async function saveFromUpload() {
       if (!csvRes.ok) {
         const e = await csvRes.json().catch(()=>({}));
         toast(`CSV parse warning: ${e.detail||'check format'}`, '');
+      } else {
+        const data = await csvRes.json().catch(()=>({}));
+        if (data.canonical_id) {
+          canonicalId = data.canonical_id;
+          if (data.date_source && data.date_source !== 'url' && canonicalId !== dateId) {
+            toast(`Date auto-corrected from ${data.date_source}: ${canonicalId}`, 'ok');
+          }
+        }
       }
     }
-    // Upload chart if attached
+    // Upload chart against the canonical id (so it sticks to the right session)
     if (RAW.chartFile && RAW.chartFile.startsWith('data:image')) {
       const res = await fetch(RAW.chartFile);
       const blob = await res.blob();
       const fd = new FormData();
       fd.append('file', blob, 'chart.png');
-      await fetch(`/upload-chart/${dateId}`, { method:'POST', headers:{'Authorization':`Bearer ${getToken()}`}, body:fd });
+      await fetch(`/upload-chart/${canonicalId}`, { method:'POST', headers:{'Authorization':`Bearer ${getToken()}`}, body:fd });
     }
     await loadSessions();
-    CUR = SESSIONS.find(s => s.id === dateId) || SESSIONS[0];
-    toast(`Session ${sess.full} saved`, 'ok');
+    CUR = SESSIONS.find(s => s.id === canonicalId) || SESSIONS.find(s => s.id === dateId) || SESSIONS[0];
+    toast(`Session saved for ${canonicalId}`, 'ok');
     resetUpload();
     setView('today');
   } catch(e) { toast(e.message, 'err'); }
@@ -1331,9 +1342,14 @@ async function reuploadCSV(inp) {
       toast(`CSV error: ${e.detail||res.status}`, 'err'); return;
     }
     const data = await res.json();
-    toast(`[${data.broker||'Generic'}] Parsed ${data.executed||0} trades, ${(data.strikes||[]).length} strikes`, 'ok');
+    const newId = data.canonical_id || CUR.id;
+    if (data.date_source && data.date_source !== 'url' && newId !== CUR.id) {
+      toast(`Session date auto-corrected from ${data.date_source}: ${newId}`, 'ok');
+    } else {
+      toast(`[${data.broker||'Generic'}] Parsed ${data.executed||0} trades, ${(data.strikes||[]).length} strikes`, 'ok');
+    }
     await loadSessions();
-    CUR = SESSIONS.find(s => s.id === CUR.id) || CUR;
+    CUR = SESSIONS.find(s => s.id === newId) || CUR;
     renderView();
   } catch(e) { toast(e.message, 'err'); }
 }

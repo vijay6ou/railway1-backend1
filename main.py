@@ -5,7 +5,63 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session as DBSession
-import json, os, base64
+import json, os, base64, re
+
+# Map for parsing month names embedded in filenames (e.g. "8th may 2026").
+_FILENAME_MONTHS = {
+    'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+    'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12,
+}
+
+
+def _date_from_filename(filename: str):
+    """
+    Best-effort extract a YYYY-MM-DD date from a broker CSV filename.
+    Tries: ISO (YYYY-MM-DD), DD-MM-YYYY, then '8th may 2026' style.
+    """
+    if not filename:
+        return None
+    # 2026-05-09 / 2026_05_09 / 2026.05.09
+    m = re.search(r'(20\d{2})[-/_.](\d{1,2})[-/_.](\d{1,2})', filename)
+    if m:
+        yy, mm, dd = m.groups()
+        try:
+            return f"{yy}-{int(mm):02d}-{int(dd):02d}"
+        except ValueError:
+            pass
+    # 09-05-2026 / 09_05_2026 / 09.05.2026
+    m = re.search(r'(\d{1,2})[-/_.](\d{1,2})[-/_.](20\d{2})', filename)
+    if m:
+        dd, mm, yy = m.groups()
+        try:
+            return f"{yy}-{int(mm):02d}-{int(dd):02d}"
+        except ValueError:
+            pass
+    # "8th may 2026" / "08 May 2026"
+    m = re.search(
+        r'(\d{1,2})\s*(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(20\d{2})',
+        filename.lower()
+    )
+    if m:
+        try:
+            return f"{m.group(3)}-{_FILENAME_MONTHS[m.group(2)[:3]]:02d}-{int(m.group(1)):02d}"
+        except (KeyError, ValueError):
+            pass
+    return None
+
+
+def _ddmmyyyy_to_iso(s: str):
+    """Convert parser's DD/MM/YYYY session_date to YYYY-MM-DD; None on failure."""
+    if not s:
+        return None
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', s)
+    if not m:
+        return None
+    dd, mm, yyyy = m.groups()
+    try:
+        return f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
+    except ValueError:
+        return None
 
 from database import engine, get_db, Base
 from models import Session as SessionModel, OpenPosition
@@ -178,11 +234,49 @@ async def upload_csv(session_id: str, file: UploadFile = File(...),
     result = parse_orderbook_csv(csv_text, carry_in=carry_in)
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
+
+    # ── Determine the canonical session date ──
+    # Priority: CSV trade-date (most reliable) > filename date > URL session_id.
+    # This prevents the "today's date used because user uploaded days late" bug.
+    csv_date_iso  = _ddmmyyyy_to_iso(result.get("session_date"))
+    file_date_iso = _date_from_filename(filename)
+    canonical_id  = csv_date_iso or file_date_iso or session_id
+    date_source = ("csv" if csv_date_iso
+                   else "filename" if file_date_iso
+                   else "url")
+
+    if canonical_id != session_id:
+        # The frontend creates a row at the URL id (typically today's date) BEFORE
+        # uploading the CSV. If that row has no csv_data of its own, fold its
+        # user-typed metadata into the canonical row, then drop the ghost.
+        ghost = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+        if ghost and not ghost.csv_data:
+            target = db.query(SessionModel).filter(SessionModel.id == canonical_id).first()
+            if target is None:
+                target = SessionModel(id=canonical_id, date=canonical_id, full=canonical_id,
+                                      index_name=ghost.index_name or result["index_name"])
+                db.add(target)
+                db.flush()
+            # Copy fields the user may have set (vix, dte, capital, journal, peers, etc.)
+            for fld in ('index_name', 'dte', 'vix', 'capital', 'mt', 'note', 'journal',
+                        'peer_rois_json', 'scores_json',
+                        'violations_json', 'strengths_json',
+                        'chart_image', 'journal_charts_json'):
+                v = getattr(ghost, fld, None)
+                if v not in (None, '', [], {}, '[]', '{}'):
+                    setattr(target, fld, v)
+            db.delete(ghost)
+            db.commit()
+        session_id = canonical_id
+
     row = db.query(SessionModel).filter(SessionModel.id == session_id).first()
     if not row:
         row = SessionModel(id=session_id, date=session_id, full=session_id,
                            index_name=result["index_name"])
         db.add(row)
+    # Always refresh date / full so the displayed date follows the canonical id.
+    row.date = session_id
+    row.full = session_id
     row.csv_data               = csv_text
     row.csv_filename           = filename
     row.gross_pnl              = result["gross_pnl"]
@@ -219,6 +313,9 @@ async def upload_csv(session_id: str, file: UploadFile = File(...),
         ))
 
     db.commit()
+    msg = f"[{result.get('broker','Generic')}] Parsed {result['executed']} orders, {len(result['strikes'])} strikes"
+    if date_source != "url":
+        msg += f"  •  Date set from {date_source}: {session_id}"
     return {
         "session_id": session_id, "gross_pnl": result["gross_pnl"],
         "net_pnl": result["net_pnl"], "ce_pnl": result["ce_pnl"],
@@ -230,7 +327,10 @@ async def upload_csv(session_id: str, file: UploadFile = File(...),
         "carry_in_realized": result.get("carry_in_realized", 0.0),
         "peak_margin":       result.get("peak_margin", 0.0),
         "broker":  result.get("broker", "Generic"),
-        "message": f"[{result.get('broker','Generic')}] Parsed {result['executed']} orders, {len(result['strikes'])} strikes"
+        "session_date":      result.get("session_date"),
+        "canonical_id":      session_id,    # so frontend can refresh URL/state
+        "date_source":       date_source,   # 'csv' | 'filename' | 'url'
+        "message": msg,
     }
 
 

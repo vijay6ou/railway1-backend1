@@ -11,26 +11,38 @@ from datetime import datetime
 
 
 # ── Column name alias map (covers Zerodha, Upstox, Angel, Fyers, IIFL, 5paisa, STOXXO/Jainam) ──
-SYMBOL_COLS   = ['symbolname','symbol','tradingsymbol','scripname','scrip',
+SYMBOL_COLS   = ['tradinginstrument','tradinginstr','tradeinstrument',  # Definedge
+                 'symbolname','symbol','tradingsymbol','scripname','scrip',
                  'instrument','instrumentname','stock','contractname','contract']
 SIDE_COLS     = ['side','transactiontype','transaction_type','buysell','buy/sell','buy_sell',
                  'type','order_type','ordertype','b/s','direction','tradetype','trade_type',
                  'orderside','txnside']
-TIME_COLS     = ['time','tradetime','ordertime','timestamp','timedate','datetime',
+TIME_COLS     = ['exchangetimestamp',  # XTS / Jainam (full datetime, parsed best)
+                 'time','tradetime','ordertime','timestamp','timedate','datetime',
                  'executiontime','tradeddatetime','exchangetime','tradedat','tradedtime',
-                 'orderexecutiontime','exchangeordertime','exchordertime','filltime']
+                 'orderexecutiontime','exchangeordertime','exchordertime','filltime',
+                 'transtime','xtsupdatetime']
 DATE_COLS     = ['tradedate','trade_date','date','orderdate','order_date','executiondate']
-QTY_COLS      = ['tradeqty','trade_qty','qty','filledqty','filled_qty','quantity',
-                 'tradedqty','traded_qty','executedqty','executed_qty','lotsize','lots',
-                 'totalqty','total_qty','tradequantity','filledquantity','executedquantity']
-PRICE_COLS    = ['tradeprice','trade_price','price','averageprice','average_price',
-                 'avg_price','avgprice','executedprice','executed_price','tradedprice',
-                 'traded_price','lastprice','last_price','fillprice','fill_price','rate',
-                 'avgexecutionprice','execution_price','avgtradeprice']
+# Order matters — most-specific "actual filled qty" first, ambiguous "qty" last.
+# XTS has BOTH 'tradeqty' (= lot size, e.g. 20) AND 'tradedquantity' (= total filled,
+# e.g. 200). Always prefer tradedquantity / executedquantity / filledquantity.
+QTY_COLS      = ['tradedquantity','traded_quantity','executedquantity','executed_quantity',
+                 'filledquantity','filled_quantity','tradedqty','traded_qty','filledqty','filled_qty',
+                 'executedqty','executed_qty','quantity','tradequantity',
+                 'tradeqty','trade_qty','qty','totalqty','total_qty','lotsize','lots']
+# Order matters — XTS has 'price' (= limit) AND 'averageprice' (= actual fill VWAP).
+# Always prefer the explicit average / traded price; fall back to plain 'price' last.
+PRICE_COLS    = ['averageprice','average_price','avg_price','avgprice',
+                 'avgexecutionprice','avgtradeprice','tradedprice','traded_price',
+                 'tradeprice','trade_price','executedprice','executed_price',
+                 'fillprice','fill_price','execution_price',
+                 'price','lastprice','last_price','rate']
 STATUS_COLS   = ['status','orderstatus','order_status','state','orderstate','ordstatus','exchange_status']
 
 # ── Broker format presets (for autodetection display) ──
 BROKER_FORMATS = [
+    ('XTS / Jainam Pro',        ['exchg.seg','tradingsymbol','buy/sell','tradedquantity','averageprice']),
+    ('Definedge / Dhan',        ['time','tradeinstrument','type','quantity','price','lots']),
     ('Zerodha (Kite/Console)',  ['tradingsymbol','trade_price','order_execution_time']),
     ('Upstox',                  ['scrip','trade_type','traded_price','trade_date']),
     ('Angel One',               ['symbol','transactiontype','tradedquantity','averageprice']),
@@ -68,9 +80,56 @@ def _norm_cols(row):
             for k,v in row.items()}
 
 
+_MONTH_MAP = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
+              'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
+
+
+def canonicalize_symbol(symbol: str) -> str:
+    """
+    Return a single canonical form for the same option contract regardless of
+    broker-specific spelling. This is critical so that the carry-in lookup
+    (OpenPosition.symbol) matches when day 5 was uploaded from one broker
+    and day 6 from another.
+
+    Canonical form: <INDEX><YY><M or MM><DD><STRIKE><CE|PE>
+                    e.g. SENSEX2651479400CE  (May 14 2026, 79400 CE)
+
+    Examples:
+        'SENSEX2651479400CE'             → 'SENSEX2651479400CE'
+        'SENSEX 14 MAY 2026 79400 CE '   → 'SENSEX2651479400CE'
+        ' nifty24nov24000pe '            → 'NIFTY26112424000PE'  (if year=26)
+    """
+    if not symbol:
+        return ''
+    s = re.sub(r'\s+', '', str(symbol)).upper()
+    info = parse_symbol(s)
+    if not (info.get('index') and info.get('strike') and info.get('option_type') and info.get('expiry')):
+        return s   # fall back to whitespace-stripped original
+    parts = info['expiry'].split('/')
+    if len(parts) != 3:
+        return s
+    dd_str, mid_str, yr_str = parts
+    if mid_str.upper() in _MONTH_MAP:
+        mo = _MONTH_MAP[mid_str.upper()]
+    elif mid_str.isdigit():
+        mo = int(mid_str)
+    else:
+        return s
+    try:
+        dd = int(dd_str); yr = int(yr_str) % 100
+    except ValueError:
+        return s
+    if mo < 10:
+        date_compact = f"{yr:02d}{mo}{dd:02d}"      # 5-char e.g. "26514"
+    else:
+        date_compact = f"{yr:02d}{mo:02d}{dd:02d}"  # 6-char e.g. "261014"
+    return f"{info['index']}{date_compact}{info['strike']}{info['option_type']}"
+
+
 def parse_symbol(symbol: str) -> dict:
     """Parse NSE/BSE option symbol. Handles NIFTY, BANKNIFTY, SENSEX, FINNIFTY, MIDCPNIFTY."""
-    s = symbol.upper().strip()
+    # Strip whitespace anywhere in the symbol so 'SENSEX 14 MAY 2026 79400 CE' parses.
+    s = re.sub(r'\s+', '', symbol).upper().strip()
     # Standard compact format: INDEX + YYMMDD + STRIKE + CE/PE
     m = re.match(
         r'^(NIFTY|BANKNIFTY|SENSEX|FINNIFTY|MIDCPNIFTY|BANKEX)(\d{5,6}?)(\d{4,6})(CE|PE)$', s)
@@ -90,12 +149,19 @@ def parse_symbol(symbol: str) -> dict:
             expiry = expiry_raw
         return {"index": index, "expiry": expiry, "strike": int(strike), "option_type": opt_type}
 
-    # Alternate: INDEX + DD + MON + YY + STRIKE + CE/PE (e.g. NIFTY24APR2526000CE)
+    # Alternate: INDEX + DD + MON + YY + STRIKE + CE/PE (e.g. NIFTY24APR2526000CE
+    # or SENSEX14MAY202679400CE after we space-stripped 'SENSEX 14 MAY 2026 79400 CE').
     m2 = re.match(
         r'^(NIFTY|BANKNIFTY|SENSEX|FINNIFTY|MIDCPNIFTY|BANKEX)(\d{2})([A-Z]{3})(\d{2,4})(\d{4,6})(CE|PE)$', s)
     if m2:
         index, dd, mon, yr, strike, opt_type = m2.groups()
-        return {"index": index, "expiry": f"{dd}/{mon}/{yr}", "strike": int(strike), "option_type": opt_type}
+        # Normalise to DD/MM/YYYY so it matches the other format's expiry string —
+        # required for the ELM-on-expiry-day check.
+        mo_num = _MONTH_MAP.get(mon.upper(), 0)
+        yyyy = yr if len(yr) == 4 else f"20{int(yr):02d}"
+        expiry = (f"{int(dd):02d}/{mo_num:02d}/{yyyy}"
+                  if mo_num else f"{dd}/{mon}/{yr}")
+        return {"index": index, "expiry": expiry, "strike": int(strike), "option_type": opt_type}
 
     return {"index": s.split('2')[0] if '2' in s else s, "expiry": None, "strike": None, "option_type": None}
 
@@ -105,23 +171,36 @@ def _parse_time(raw):
     if not raw:
         return None
     raw = str(raw).strip()
-    # Try common patterns (covers Zerodha, Upstox, Angel, Fyers, IIFL, 5paisa, STOXXO)
-    for fmt in ('%H:%M:%S', '%H:%M', '%d/%m/%Y %H:%M:%S', '%d-%m-%Y %H:%M:%S',
-                '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%d/%m/%Y %H:%M',
-                '%m/%d/%Y %H:%M:%S', '%d-%b-%Y %H:%M:%S', '%Y-%m-%d %H:%M',
+    # 12-hour format with AM/PM (Definedge/Dhan: '03:29:30 PM') — case-insensitive.
+    raw_norm = raw.upper().replace('A.M.', 'AM').replace('P.M.', 'PM').replace('  ', ' ')
+    # Try common patterns (covers Zerodha, Upstox, Angel, Fyers, IIFL, 5paisa, STOXXO,
+    # XTS/Jainam '08-05-2026 15:29:30', Definedge '03:29:30 PM').
+    for fmt in ('%I:%M:%S %p', '%I:%M %p',                 # 12-hr AM/PM
+                '%H:%M:%S', '%H:%M',                       # 24-hr
+                '%d-%m-%Y %H:%M:%S', '%d/%m/%Y %H:%M:%S',  # XTS/Jainam datetime
+                '%d-%m-%Y %H:%M',     '%d/%m/%Y %H:%M',
+                '%Y-%m-%d %H:%M:%S',  '%Y-%m-%dT%H:%M:%S',
+                '%m/%d/%Y %H:%M:%S',  '%d-%b-%Y %H:%M:%S',
+                '%Y-%m-%d %H:%M',     '%d-%b-%Y %H:%M',
+                '%Y-%m-%dT%H:%M:%S.%f',
+                '%d/%m/%Y %I:%M:%S %p', '%d-%m-%Y %I:%M:%S %p',  # date + 12-hr AM/PM
+                '%Y-%m-%d %I:%M:%S %p',
                 '%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d-%b-%Y',
-                '%Y-%m-%dT%H:%M:%S.%f', '%d-%b-%Y %H:%M',
                 '%H:%M:%S / %d-%m-%Y', '%H:%M / %d-%m-%Y'):  # STOXXO Time/Date
         try:
-            dt = datetime.strptime(raw, fmt)
+            dt = datetime.strptime(raw_norm, fmt)
             if dt.hour == 0 and dt.minute == 0 and ':' not in raw and 'T' not in raw:
                 return None
             return dt.strftime('%H:%M')
         except ValueError:
             continue
-    m = re.search(r'(\d{2}):(\d{2})', raw)
+    # Fallback: regex-extract HH:MM, honouring trailing AM/PM if present.
+    m = re.search(r'(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?', raw_norm)
     if m:
         h, mn = int(m.group(1)), int(m.group(2))
+        ap = m.group(3)
+        if ap == 'PM' and h < 12: h += 12
+        elif ap == 'AM' and h == 12: h = 0
         if 0 <= h <= 23 and 0 <= mn <= 59:
             return f"{h:02d}:{mn:02d}"
     return None
@@ -351,7 +430,7 @@ def parse_orderbook_csv(csv_text: str, carry_in: list = None) -> dict:
     carry_seeded = set()
     for c in carry_in:
         try:
-            sym = c['symbol'].strip().upper()
+            sym = canonicalize_symbol(c['symbol'])
             side = c['side']
             cqty = float(c['qty']); cpx = float(c['avg_price'])
         except (KeyError, TypeError, ValueError):
@@ -378,7 +457,9 @@ def parse_orderbook_csv(csv_text: str, carry_in: list = None) -> dict:
         symbol = _get(row, SYMBOL_COLS)
         if not symbol:
             continue
-        symbol = symbol.strip().upper()
+        # Canonicalise so 'SENSEX 14 MAY 2026 79400 CE' and 'SENSEX2651479400CE'
+        # collapse to the SAME key — required for carry matching across brokers.
+        symbol = canonicalize_symbol(symbol)
 
         side_raw = (_get(row, SIDE_COLS) or '').upper().strip()
         qty_raw  = _get(row, QTY_COLS)
@@ -519,7 +600,7 @@ def parse_orderbook_csv(csv_text: str, carry_in: list = None) -> dict:
         running = defaultdict(lambda: {"buys": [], "sells": [], "last_realized": 0.0})
         for c in carry_in:
             try:
-                sym = c['symbol'].strip().upper()
+                sym = canonicalize_symbol(c['symbol'])
                 side = c['side']; cqty = float(c['qty']); cpx = float(c['avg_price'])
             except Exception:
                 continue
